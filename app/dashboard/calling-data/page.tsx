@@ -16,11 +16,13 @@ import {
 } from "@/lib/calling-lead-assignee"
 import {
   pickRicherCallRemark,
+  readDealerCallingActions,
   resolveCallingActionRemark,
   resolveLeadPriorCallReview,
   type PriorCallReviewSource,
   type StoredDealerCallingAction,
 } from "@/lib/dealer-calling-action-history"
+import { extractCallingActionList, journeyMobilesMatch } from "@/lib/journey-calling-actions"
 import { getRealtime } from "@/lib/realtime"
 import { DashboardNav } from "@/components/dashboard-nav"
 import { CityMultiSelectFilter } from "@/components/city-multi-select-filter"
@@ -926,9 +928,13 @@ export default function CallingDataPage() {
 
 
   const getStoredDealerActionBuckets = () => {
-    const stored: ActionLogItem[] = []
+    const stored: ActionLogItem[] = currentDealerId
+      ? readDealerCallingActions(currentDealerId).map((row) => normalizeActionLog(row))
+      : []
     const dialled = stored.filter((item) =>
-      ["called", "follow_up", "not_interested", "rescheduled"].includes(String(item.action || "").toLowerCase()),
+      ["called", "follow_up", "not_interested", "rescheduled", "completed", "dialled"].includes(
+        String(item.action || "").toLowerCase(),
+      ) || Boolean(String(item.callRemark || item.statusText || "").trim()),
     )
     const connected = stored.filter((item) => {
       const parsed = parseTaggedCallRemark(item.callRemark)
@@ -998,6 +1004,8 @@ export default function CallingDataPage() {
   }
 
   const extractCallingActionsFromResponse = (response: any): any[] => {
+    const fromShared = extractCallingActionList(response)
+    if (fromShared.length > 0) return fromShared
     const source =
       response?.actions ||
       response?.callingActions ||
@@ -1008,6 +1016,28 @@ export default function CallingDataPage() {
       response?.actionHistory ||
       []
     return Array.isArray(source) ? source : []
+  }
+
+  const isDialledHistoryAction = (item: ActionLogItem) => {
+    const action = String(item.action || "").toLowerCase()
+    if (["start", "queued", "assigned", "pending"].includes(action)) return false
+    if (["called", "follow_up", "not_interested", "rescheduled", "completed", "dialled", "connected"].includes(action)) {
+      return true
+    }
+    // Backend rows sometimes omit `action` but still carry outcome remark/status.
+    return Boolean(String(item.callRemark || item.statusText || item.status_text || "").trim())
+  }
+
+  const matchesActionLogSearch = (item: ActionLogItem, term: string, extraFields: string[] = []) => {
+    const raw = term.trim().toLowerCase()
+    if (!raw) return true
+    const termDigits = normalizePhoneDigits(raw)
+    if (termDigits.length >= 7 && journeyMobilesMatch(item.mobile, termDigits)) return true
+    const haystack = [item.name, item.mobile, item.kNumber, item.address, item.callRemark, ...extraFields]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+    return haystack.includes(raw)
   }
 
   const formatDateTime = (value?: string) => {
@@ -1571,16 +1601,28 @@ export default function CallingDataPage() {
   const loadDealerAnalyticsActions = async () => {
     if (!authReady || !isAuthenticated) return
 
-    const localActions: ActionLogItem[] = []
+    const storedBuckets = getStoredDealerActionBuckets()
+    const localActions = mergeActionLogEntries(storedBuckets.all)
 
     if (!useApi || !currentDealerId) {
       setAnalyticsActions(localActions)
+      if (localActions.length > 0) {
+        setRecentActions((prev) => mergeActionLogEntries([...prev, ...localActions]))
+        setDialledActions((prev) =>
+          mergeActionLogEntries([...prev, ...localActions.filter(isDialledHistoryAction)]),
+        )
+        setConnectedActionItems((prev) => mergeActionLogEntries([...prev, ...storedBuckets.connected]))
+        setNotConnectedActionItems((prev) =>
+          mergeActionLogEntries([...prev, ...storedBuckets.notConnected]),
+        )
+      }
       return
     }
 
     const queryParams = {
       limit: 2000,
       dealerId: currentDealerId,
+      range: "all" as const,
     }
 
     let apiRows: any[] = []
@@ -1602,11 +1644,25 @@ export default function CallingDataPage() {
     }
 
     const fromApi = apiRows.map((entry) => normalizeActionLog(entry))
-    // Avoid double-counting the same call from API + local cache.
-    // API is the source of truth; use local rows only when API has no data.
-    const sourceRows = fromApi.length > 0 ? fromApi : localActions
-    const merged = mergeActionLogEntries(sourceRows)
+    // Prefer API rows; keep local cache only to fill gaps the queue history omitted.
+    const merged = mergeActionLogEntries([...fromApi, ...localActions])
     setAnalyticsActions(merged.length > 0 ? merged : localActions)
+
+    if (merged.length > 0) {
+      const dialledFromHistory = merged.filter(isDialledHistoryAction)
+      const connectedFromHistory = merged.filter((item) => {
+        const parsed = parseTaggedCallRemark(item.callRemark)
+        return Boolean(parsed.status) && !NOT_CONNECTED_REASONS.includes(parsed.status)
+      })
+      const notConnectedFromHistory = merged.filter((item) => {
+        const parsed = parseTaggedCallRemark(item.callRemark)
+        return Boolean(parsed.status) && NOT_CONNECTED_REASONS.includes(parsed.status)
+      })
+      setRecentActions((prev) => mergeActionLogEntries([...prev, ...merged]))
+      setDialledActions((prev) => mergeActionLogEntries([...prev, ...dialledFromHistory]))
+      setConnectedActionItems((prev) => mergeActionLogEntries([...prev, ...connectedFromHistory]))
+      setNotConnectedActionItems((prev) => mergeActionLogEntries([...prev, ...notConnectedFromHistory]))
+    }
   }
 
   useEffect(() => {
@@ -1620,6 +1676,72 @@ export default function CallingDataPage() {
     void loadDealerAnalyticsActions()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authReady, isAuthenticated, useApi, currentDealerId])
+
+  // When Dialled/Connected/Not Connected search looks like a mobile, ask backend for that number
+  // (queue history is often truncated; analytics limit can also miss older rows).
+  useEffect(() => {
+    if (!authReady || !isAuthenticated || !useApi || !currentDealerId) return
+    const term = (dialledSearchTerm || connectedSearchTerm || notConnectedSearchTerm).trim()
+    const digits = normalizePhoneDigits(term)
+    if (digits.length < 8) return
+
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      const queryParams = {
+        limit: 200,
+        dealerId: currentDealerId,
+        search: digits.slice(-10),
+        range: "all" as const,
+      }
+      let apiRows: any[] = []
+      try {
+        const response = await api.dealers.callingActions.getAll(queryParams)
+        apiRows = extractCallingActionsFromResponse(response)
+      } catch {
+        apiRows = []
+      }
+      if (apiRows.length === 0) {
+        try {
+          const response = await api.hr.callingActions.getAll(queryParams)
+          apiRows = extractCallingActionsFromResponse(response)
+        } catch {
+          apiRows = []
+        }
+      }
+      if (cancelled || apiRows.length === 0) return
+
+      const normalized = apiRows.map((entry) => normalizeActionLog(entry))
+      const dialledFromHistory = normalized.filter(isDialledHistoryAction)
+      const connectedFromHistory = normalized.filter((item) => {
+        const parsed = parseTaggedCallRemark(item.callRemark)
+        return Boolean(parsed.status) && !NOT_CONNECTED_REASONS.includes(parsed.status)
+      })
+      const notConnectedFromHistory = normalized.filter((item) => {
+        const parsed = parseTaggedCallRemark(item.callRemark)
+        return Boolean(parsed.status) && NOT_CONNECTED_REASONS.includes(parsed.status)
+      })
+
+      setAnalyticsActions((prev) => mergeActionLogEntries([...prev, ...normalized]))
+      setRecentActions((prev) => mergeActionLogEntries([...prev, ...normalized]))
+      setDialledActions((prev) => mergeActionLogEntries([...prev, ...dialledFromHistory]))
+      setConnectedActionItems((prev) => mergeActionLogEntries([...prev, ...connectedFromHistory]))
+      setNotConnectedActionItems((prev) => mergeActionLogEntries([...prev, ...notConnectedFromHistory]))
+    }, 350)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    authReady,
+    isAuthenticated,
+    useApi,
+    currentDealerId,
+    dialledSearchTerm,
+    connectedSearchTerm,
+    notConnectedSearchTerm,
+  ])
 
   useEffect(() => {
     if (!authReady || !isAuthenticated || !useApi) return
@@ -1887,48 +2009,43 @@ export default function CallingDataPage() {
   }, [scheduledLeads])
 
   const flowDialledActions = useMemo(() => {
-    const source =
-      dialledActions.length > 0
-        ? dialledActions
-        : recentActions.filter((item) => {
-            if (hasUpcomingFollowUp(item)) return false
-            return ["called", "follow_up", "not_interested", "rescheduled"].includes(
-              String(item.action || "").toLowerCase(),
-            )
-          })
-    return source.filter((item) => {
+    const merged = mergeActionLogEntries([
+      ...dialledActions,
+      ...recentActions,
+      ...analyticsActions,
+    ])
+    return merged.filter((item) => {
       if (hasUpcomingFollowUp(item)) return false
+      if (!isDialledHistoryAction(item)) return false
       const action = String(item.action || "").toLowerCase()
-      if (!["called", "follow_up", "not_interested", "rescheduled"].includes(action)) return false
       if (item.leadId && scheduledFutureLeadIds.has(item.leadId) && (action === "rescheduled" || action === "follow_up")) {
         return false
       }
       return true
     })
-  }, [dialledActions, recentActions, scheduledFutureLeadIds])
+  }, [dialledActions, recentActions, analyticsActions, scheduledFutureLeadIds])
 
   const filteredFlowDialledActions = useMemo(() => {
-    const term = dialledSearchTerm.trim().toLowerCase()
+    const term = dialledSearchTerm.trim()
     return flowDialledActions.filter((item) => {
       const action = String(item.action || "").toLowerCase()
       if (dialledActionFilter !== "all" && action !== dialledActionFilter) return false
-      if (!term) return true
-      const haystack = [item.name, item.mobile, item.kNumber, item.address, item.callRemark]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-      return haystack.includes(term)
+      return matchesActionLogSearch(item, term)
     })
   }, [flowDialledActions, dialledSearchTerm, dialledActionFilter])
 
   const flowConnectedActions = useMemo(() => {
-    const source = connectedActionItems.length > 0 ? connectedActionItems : recentActions
-    return source.filter((item) => {
+    const merged = mergeActionLogEntries([
+      ...connectedActionItems,
+      ...recentActions,
+      ...analyticsActions,
+    ])
+    return merged.filter((item) => {
       if (hasUpcomingFollowUp(item)) return false
       const parsed = parseTaggedRemark(item.callRemark)
       return !!parsed.status && !NOT_CONNECTED_REASONS.includes(parsed.status)
     })
-  }, [connectedActionItems, recentActions])
+  }, [connectedActionItems, recentActions, analyticsActions])
 
   function getConnectedOutcomeForStatus(status: string): "interested" | "not_interested" | "decision_pending" {
     if (LOST_REASONS.includes(status) || status === "Not Interested" || status === "Not Interested Currently") {
@@ -1941,7 +2058,7 @@ export default function CallingDataPage() {
   }
 
   const filteredFlowConnectedActions = useMemo(() => {
-    const term = connectedSearchTerm.trim().toLowerCase()
+    const term = connectedSearchTerm.trim()
     const afterOutcomeFilter =
       connectedOutcomeFilter === "all"
         ? flowConnectedActions
@@ -1952,36 +2069,30 @@ export default function CallingDataPage() {
             return getConnectedOutcomeForStatus(status) === connectedOutcomeFilter
           })
     return afterOutcomeFilter.filter((item) => {
-      if (!term) return true
       const parsed = parseTaggedRemark(item.callRemark)
-      const haystack = [item.name, item.mobile, item.kNumber, item.address, parsed.status, parsed.remark]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-      return haystack.includes(term)
+      return matchesActionLogSearch(item, term, [parsed.status, parsed.remark])
     })
   }, [flowConnectedActions, connectedOutcomeFilter, connectedSearchTerm])
 
   const flowNotConnectedActions = useMemo(() => {
-    const source = notConnectedActionItems.length > 0 ? notConnectedActionItems : recentActions
-    return source.filter((item) => {
+    const merged = mergeActionLogEntries([
+      ...notConnectedActionItems,
+      ...recentActions,
+      ...analyticsActions,
+    ])
+    return merged.filter((item) => {
       if (hasUpcomingFollowUp(item)) return false
       const parsed = parseTaggedRemark(item.callRemark)
       return !!parsed.status && NOT_CONNECTED_REASONS.includes(parsed.status)
     })
-  }, [notConnectedActionItems, recentActions])
+  }, [notConnectedActionItems, recentActions, analyticsActions])
   const filteredFlowNotConnectedActions = useMemo(() => {
-    const term = notConnectedSearchTerm.trim().toLowerCase()
+    const term = notConnectedSearchTerm.trim()
     return flowNotConnectedActions.filter((item) => {
       const parsed = parseTaggedRemark(item.callRemark)
       const reason = (parsed.status || "").trim()
       if (notConnectedReasonFilter !== "all" && reason !== notConnectedReasonFilter) return false
-      if (!term) return true
-      const haystack = [item.name, item.mobile, item.kNumber, item.address, reason, parsed.remark]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-      return haystack.includes(term)
+      return matchesActionLogSearch(item, term, [reason, parsed.remark])
     })
   }, [flowNotConnectedActions, notConnectedSearchTerm, notConnectedReasonFilter])
 

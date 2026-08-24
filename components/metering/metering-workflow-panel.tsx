@@ -25,6 +25,12 @@ import {
 import { isInstallationUploadCompleteWithMedia } from "@/lib/installation-public-images"
 import { StoredMediaPreview } from "@/components/stored-media-preview"
 import { confirmSave } from "@/lib/confirm-save"
+import {
+  parseMeterDocumentNameFromApiPayload,
+  parseMeterDocumentUrlFromApiPayload,
+  readQuotationMeterDocument,
+  toMeterDocumentPublicViewUrl,
+} from "@/lib/parse-api-media"
 
 /** Meter process (left) + Bank process (right) tabs — same order as Admin Metering. */
 export type MeteringStage =
@@ -641,14 +647,24 @@ export function MeteringWorkflowPanel({
         },
         meterDocumentByQuotation[detailsQuotationId] || null,
       )
-      const saved = response?.data || response || {}
-      const meterDocumentUrl =
-        saved.meterDocumentUrl ||
-        saved.meter_document_url ||
-        saved.documents?.meterDocumentUrl ||
-        saved.documents?.meter_document_url
+      let meterDocumentUrl =
+        toMeterDocumentPublicViewUrl(parseMeterDocumentUrlFromApiPayload(response)) ||
+        parseMeterDocumentUrlFromApiPayload(response)
       const meterDocumentName =
-        saved.meterDocumentName || saved.meter_document_name || workflowMap[detailsQuotationId]?.meterDocumentName
+        parseMeterDocumentNameFromApiPayload(response) ||
+        workflowMap[detailsQuotationId]?.meterDocumentName ||
+        meterDocumentByQuotation[detailsQuotationId]?.name
+
+      if (meterDocumentUrl) {
+        try {
+          const { resolvePublicOpenMediaUrl } = await import("@/lib/resolve-public-media-url")
+          const opened = await resolvePublicOpenMediaUrl(meterDocumentUrl, detailsQuotationId)
+          if (opened) meterDocumentUrl = toMeterDocumentPublicViewUrl(opened) || opened
+        } catch {
+          // keep parsed url
+        }
+      }
+
       if (meterDocumentUrl || meterDocumentName) {
         updateWorkflowMeta(detailsQuotationId, {
           meterDocumentUrl: meterDocumentUrl || undefined,
@@ -656,11 +672,11 @@ export function MeteringWorkflowPanel({
         })
       }
       // Keep modal state aligned with persisted backend data (public URL), not stale local blob.
-      setMeterDocumentByQuotation((prev) => ({
-        ...prev,
-        [detailsQuotationId]: null,
-      }))
       if (meterDocumentUrl) {
+        setMeterDocumentByQuotation((prev) => ({
+          ...prev,
+          [detailsQuotationId]: null,
+        }))
         setMeterDocumentPreviewByQuotation((prev) => ({
           ...prev,
           [detailsQuotationId]: meterDocumentUrl,
@@ -681,11 +697,20 @@ export function MeteringWorkflowPanel({
                 authorized_representative: patch.authorizedRepresentative || q.authorized_representative,
                 meterDocumentUrl: meterDocumentUrl || q.meterDocumentUrl,
                 meter_document_url: meterDocumentUrl || q.meter_document_url,
+                meterDocumentPublicUrl: meterDocumentUrl || q.meterDocumentPublicUrl,
+                meter_document_public_url: meterDocumentUrl || q.meter_document_public_url,
+                meterDocumentName: meterDocumentName || q.meterDocumentName,
+                meter_document_name: meterDocumentName || q.meter_document_name,
               }
             : q,
         ),
       )
-      toast({ title: "Saved", description: "Metering details saved to backend." })
+      toast({
+        title: "Saved",
+        description: meterDocumentUrl
+          ? "Metering details saved. Document public link is ready to view."
+          : "Metering details saved to backend.",
+      })
       setDetailsModalOpen(false)
     } catch (error) {
       toast({
@@ -1518,15 +1543,21 @@ export function MeteringWorkflowPanel({
               {(() => {
                 if (!detailsQuotationId) return null
                 const row = quotations.find((q) => q.id === detailsQuotationId) as any
+                const fromRow = readQuotationMeterDocument(row)
                 const savedUrl =
-                  row?.meterDocumentPublicUrl ||
-                  row?.meter_document_public_url ||
-                  workflowMap[detailsQuotationId]?.meterDocumentUrl ||
-                  row?.meterDocumentUrl ||
-                  row?.meter_document_url
+                  fromRow.url ||
+                  toMeterDocumentPublicViewUrl(
+                    row?.meterDocumentPublicUrl ||
+                      row?.meter_document_public_url ||
+                      workflowMap[detailsQuotationId]?.meterDocumentUrl ||
+                      row?.meterDocumentUrl ||
+                      row?.meter_document_url ||
+                      meterDocumentPreviewByQuotation[detailsQuotationId],
+                  )
                 const localFile = meterDocumentByQuotation[detailsQuotationId] || null
                 const savedName =
                   meterDocumentByQuotation[detailsQuotationId]?.name ||
+                  fromRow.name ||
                   workflowMap[detailsQuotationId]?.meterDocumentName ||
                   row?.meterDocumentName ||
                   row?.meter_document_name

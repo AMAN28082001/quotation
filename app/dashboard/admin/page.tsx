@@ -51,7 +51,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { api, ApiError, apiErrorToUserMessage, fetchSentToInstallerQuotationRows, getAuthToken, isApiAuthFailure, sendQuotationToMetering } from "@/lib/api"
 import { isQuotationAdminAccess } from "@/lib/admin-access"
 import {
-  USER_ACCESS_OPTIONS,
+  ASSIGNABLE_USER_ACCESS_OPTIONS,
   accessLabels,
   getAccessOverride,
   hasAccess,
@@ -72,6 +72,7 @@ import { AdminProductManagement } from "@/components/admin-product-management"
 import { AdminPricingTablesManagement } from "@/components/admin-pricing-tables-management"
 import { AdminProductNeededPanel } from "@/components/admin-product-needed-panel"
 import { CustomerJourneyPanel } from "@/components/customer-journey-panel"
+import { FullCustomerJourneyPanel } from "@/components/full-customer-journey-panel"
 import { DealersByRevenueCharts } from "@/components/dealers-by-revenue-charts"
 import { getJourneyDateRangeBounds, type JourneyDateRangeFilter } from "@/lib/customer-journey"
 import {
@@ -163,7 +164,7 @@ import {
 import { normalizeMediaUrl, pickMediaUrlFromValue, toPublicOpenHref } from "@/lib/media-url"
 import { InstallationPublicPhoto } from "@/components/installation-public-photo"
 import { StoredMediaPreview } from "@/components/stored-media-preview"
-import { parseMeterDocumentUrlFromApiPayload } from "@/lib/parse-api-media"
+import { parseMeterDocumentNameFromApiPayload, parseMeterDocumentUrlFromApiPayload, readQuotationMeterDocument, toMeterDocumentPublicViewUrl } from "@/lib/parse-api-media"
 import {
   createInstallationTeam,
   deleteInstallationTeam,
@@ -1550,6 +1551,8 @@ export default function AdminPanelPage() {
   const [activeTab, setActiveTab] = useState("overview")
   const [catalogSubTab, setCatalogSubTab] = useState<"products" | "pricing">("products")
   const [callingActions, setCallingActions] = useState<CallingActionRecord[]>([])
+  const [journeyCallingActions, setJourneyCallingActions] = useState<CallingActionRecord[]>([])
+  const [isJourneyCallingActionsLoading, setIsJourneyCallingActionsLoading] = useState(false)
   const [callingRange, setCallingRange] = useState<
     "daily" | "weekly" | "monthly" | "last_month" | "custom" | "all"
   >("daily")
@@ -2105,6 +2108,120 @@ export default function AdminPanelPage() {
     dealers,
   ])
 
+  const journeyCallingActionsRequestRef = useRef(0)
+  const journeySearchFetchRef = useRef(0)
+  const journeySearchTimerRef = useRef<number | undefined>(undefined)
+
+  const loadJourneyCallingActions = useCallback(async () => {
+    if (!useApi || !isAuthenticated || !getAuthToken()) return
+
+    const requestId = ++journeyCallingActionsRequestRef.current
+    setIsJourneyCallingActionsLoading(true)
+
+    try {
+      const response = await api.admin.callingActions.getAll({ limit: 2000, range: "all" })
+      if (requestId !== journeyCallingActionsRequestRef.current) return
+
+      const { normalizeJourneyCallingActions } = await import("@/lib/journey-calling-actions")
+      const { mobilesNeedingCallingEnrichment } = await import("@/lib/full-customer-journey")
+
+      const withDealerName = <T extends { dealerId?: string; dealerName?: string }>(item: T): T => {
+        if (item.dealerName) return item
+        const fallbackDealer = (dealers as Dealer[]).find((d) => d.id === item.dealerId)
+        if (!fallbackDealer) return item
+        return {
+          ...item,
+          dealerName: `${fallbackDealer.firstName || ""} ${fallbackDealer.lastName || ""}`.trim(),
+        }
+      }
+
+      let normalized = normalizeJourneyCallingActions(response)
+        .map((item) => withDealerName(item))
+        .sort((a, b) => new Date(b.actionAt || 0).getTime() - new Date(a.actionAt || 0).getTime())
+
+      setJourneyCallingActions(normalized as CallingActionRecord[])
+      setIsJourneyCallingActionsLoading(false)
+
+      const fetchMobile = async (mobile: string) => {
+        try {
+          const res = await api.admin.callingActions.getAll({
+            limit: 50,
+            search: mobile,
+            range: "all",
+          })
+          return normalizeJourneyCallingActions(res).map((item) => withDealerName(item))
+        } catch {
+          return []
+        }
+      }
+
+      // Normal list: backfill Calling Data/Action for quotations still pending (no mobile search required).
+      let missing = mobilesNeedingCallingEnrichment(quotations, normalized, 200)
+      for (let pass = 0; pass < 2 && missing.length > 0; pass++) {
+        if (requestId !== journeyCallingActionsRequestRef.current) return
+        for (let i = 0; i < missing.length; i += 8) {
+          if (requestId !== journeyCallingActionsRequestRef.current) return
+          const chunk = missing.slice(i, i + 8)
+          const extras = await Promise.all(chunk.map((mobile) => fetchMobile(mobile)))
+          for (const list of extras) {
+            for (const item of list) {
+              if (!normalized.some((a) => a.id === item.id)) normalized.push(item)
+            }
+          }
+        }
+        normalized = normalized.sort(
+          (a, b) => new Date(b.actionAt || 0).getTime() - new Date(a.actionAt || 0).getTime(),
+        )
+        setJourneyCallingActions(normalized as CallingActionRecord[])
+        missing = mobilesNeedingCallingEnrichment(quotations, normalized, 200)
+      }
+    } catch (error) {
+      if (requestId !== journeyCallingActionsRequestRef.current) return
+      console.error("Journey calling actions unavailable:", error)
+      setJourneyCallingActions([])
+      setIsJourneyCallingActionsLoading(false)
+    }
+  }, [useApi, isAuthenticated, dealers, quotations])
+
+  const handleJourneySearchChange = useCallback(
+    (term: string) => {
+      if (!useApi || !isAuthenticated || !getAuthToken()) return
+      const trimmed = term.trim()
+      if (trimmed.length < 3) return
+      const digits = trimmed.replace(/\D/g, "")
+
+      const requestId = ++journeySearchFetchRef.current
+      window.clearTimeout(journeySearchTimerRef.current)
+      journeySearchTimerRef.current = window.setTimeout(() => {
+        void (async () => {
+          try {
+            const { normalizeJourneyCallingActions } = await import("@/lib/journey-calling-actions")
+            const response = await api.admin.callingActions.getAll({
+              limit: 200,
+              search: digits.length >= 8 ? digits.slice(-10) : trimmed,
+              range: "all",
+            })
+            if (requestId !== journeySearchFetchRef.current) return
+            const found = normalizeJourneyCallingActions(response)
+            if (found.length === 0) return
+            setJourneyCallingActions((prev) => {
+              const byId = new Map(prev.map((a) => [a.id, a]))
+              for (const item of found) {
+                byId.set(item.id, { ...(byId.get(item.id) || {}), ...item } as CallingActionRecord)
+              }
+              return [...byId.values()].sort(
+                (a, b) => new Date(b.actionAt || 0).getTime() - new Date(a.actionAt || 0).getTime(),
+              )
+            })
+          } catch {
+            // ignore search enrichment failures
+          }
+        })()
+      }, 350)
+    },
+    [useApi, isAuthenticated],
+  )
+
   useEffect(() => {
     if (!isAuthenticated) {
       adminLoadRequestRef.current += 1
@@ -2136,6 +2253,12 @@ export default function AdminPanelPage() {
     activeTab,
     loadCallingActionsForReports,
   ])
+
+  useEffect(() => {
+    if (!isAuthenticated || !useApi) return
+    if (activeTab !== "customer-journey") return
+    void loadJourneyCallingActions()
+  }, [isAuthenticated, useApi, activeTab, loadJourneyCallingActions])
 
   useEffect(() => {
     setOperationalProgressTab(operationalTab === "installation" || operationalTab === "metering" ? "pending" : "all")
@@ -3236,6 +3359,12 @@ export default function AdminPanelPage() {
   }, [activeTab, isAuthenticated, loadVisitorReports])
 
   useEffect(() => {
+    if (activeTab === "visitors" || activeTab === "account-management") {
+      setActiveTab("dealers")
+    }
+  }, [activeTab])
+
+  useEffect(() => {
     const timer = window.setTimeout(() => {
       setVisitorReportSearchDebounced(visitorReportSearch)
     }, 350)
@@ -3832,6 +3961,10 @@ export default function AdminPanelPage() {
 
   const onAdminDesktopTabChange = (value: string) => {
     startTransition(() => {
+      if (value === "visitors" || value === "account-management") {
+        setActiveTab("dealers")
+        return
+      }
       if (value === "products" || value === "pricing") {
         setActiveTab("catalog")
         setCatalogSubTab(value)
@@ -5274,6 +5407,7 @@ export default function AdminPanelPage() {
       const meterNo = adminMeteringDraft.meterNo.trim()
       const solarMeterNo = adminMeteringDraft.solarMeterNo.trim()
       const netMeterNo = adminMeteringDraft.netMeterNo.trim()
+      const localDoc = adminMeteringDocByQuotation[adminMeteringQuotationId] || null
       const saveResp = await api.metering.saveDetails(
         adminMeteringQuotationId,
         {
@@ -5286,16 +5420,51 @@ export default function AdminPanelPage() {
           authorizedRepresentative,
           discomLocation: adminMeteringDraft.discomLocation.trim() || undefined,
         },
-        adminMeteringDocByQuotation[adminMeteringQuotationId] || null,
+        localDoc,
       )
-      const meterDocUrl = parseMeterDocumentUrlFromApiPayload(saveResp)
-        const id = adminMeteringQuotationId
-        const localDoc = adminMeteringDocByQuotation[id]
-        setQuotations((prev) =>
-          prev.map((q) =>
-            q.id === id
-              ? ({
-                  ...q,
+      let meterDocUrl =
+        toMeterDocumentPublicViewUrl(parseMeterDocumentUrlFromApiPayload(saveResp)) ||
+        parseMeterDocumentUrlFromApiPayload(saveResp)
+      const meterDocName =
+        parseMeterDocumentNameFromApiPayload(saveResp) || localDoc?.name || undefined
+
+      // If API returned a private/key URL, ask for a browser-openable public link.
+      if (meterDocUrl) {
+        try {
+          const { resolvePublicOpenMediaUrl } = await import("@/lib/resolve-public-media-url")
+          const opened = await resolvePublicOpenMediaUrl(meterDocUrl, adminMeteringQuotationId)
+          if (opened) meterDocUrl = toMeterDocumentPublicViewUrl(opened) || opened
+        } catch {
+          // keep parsed url
+        }
+      }
+
+      const id = adminMeteringQuotationId
+      const meterDocPatch =
+        meterDocUrl || meterDocName
+          ? {
+              ...(meterDocUrl
+                ? {
+                    meterDocumentUrl: meterDocUrl,
+                    meter_document_url: meterDocUrl,
+                    meterDocumentPublicUrl: meterDocUrl,
+                    meter_document_public_url: meterDocUrl,
+                  }
+                : {}),
+              ...(meterDocName
+                ? {
+                    meterDocumentName: meterDocName,
+                    meter_document_name: meterDocName,
+                  }
+                : {}),
+            }
+          : {}
+
+      setQuotations((prev) =>
+        prev.map((q) =>
+          q.id === id
+            ? ({
+                ...q,
                 discomName,
                 discom_name: discomName,
                 meterType,
@@ -5311,28 +5480,26 @@ export default function AdminPanelPage() {
                 authorized_representative: authorizedRepresentative,
                 discomLocation: adminMeteringDraft.discomLocation.trim() || undefined,
                 discom_location: adminMeteringDraft.discomLocation.trim() || undefined,
-                ...(meterDocUrl
-                  ? {
-                  meterDocumentUrl: meterDocUrl,
-                  meter_document_url: meterDocUrl,
-                    }
-                  : localDoc
-                    ? {
-                        meterDocumentName: localDoc.name,
-                        meter_document_name: localDoc.name,
-                      }
-                    : {}),
-                } as unknown as Quotation)
-              : q,
-          ),
-        )
+                ...meterDocPatch,
+              } as unknown as Quotation)
+            : q,
+        ),
+      )
+
+      // Keep local file until we have a public URL so the modal can still preview after save+reopen in-session.
+      if (meterDocUrl) {
+        setAdminMeteringDocByQuotation((prev) => ({ ...prev, [id]: null }))
+      }
+
       setAdminMeteringModalOpen(false)
       setAdminMeteringAdvanceToDiscomAfterSave(false)
       toast({
         title: "Saved",
         description: shouldMoveToDiscom
           ? "Metering details saved. Moving to Meter in Discom…"
-          : "Metering details saved.",
+          : meterDocUrl
+            ? "Metering details saved. Document link is ready to view."
+            : "Metering details saved.",
       })
       if (shouldMoveToDiscom) {
         const latest =
@@ -5354,11 +5521,7 @@ export default function AdminPanelPage() {
           remarks,
           authorizedRepresentative,
           authorized_representative: authorizedRepresentative,
-          ...(meterDocUrl
-            ? { meterDocumentUrl: meterDocUrl, meter_document_url: meterDocUrl }
-            : localDoc
-              ? { meterDocumentName: localDoc.name, meter_document_name: localDoc.name }
-              : {}),
+          ...meterDocPatch,
         } as unknown as Quotation
         await setAdminMeteringStage(patched, "approved")
       } else {
@@ -7118,6 +7281,7 @@ export default function AdminPanelPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="overview">Overview</SelectItem>
+                <SelectItem value="customer-journey">Customer Journey</SelectItem>
                 <SelectItem value="calling-reports">Calling Reports</SelectItem>
                 <SelectItem value="visitor-reports">Visitor Reports</SelectItem>
                 <SelectItem value="quotations__all">Quotations (all)</SelectItem>
@@ -7127,10 +7291,8 @@ export default function AdminPanelPage() {
                 <SelectItem value="quotations__confirmation">Final confirmation</SelectItem>
                 <SelectItem value="dealers">Users</SelectItem>
                 <SelectItem value="customers">Customers</SelectItem>
-                <SelectItem value="visitors">Visitors</SelectItem>
                 <SelectItem value="catalog__products">Catalog — Products</SelectItem>
                 <SelectItem value="catalog__pricing">Catalog — Pricing</SelectItem>
-                <SelectItem value="account-management">Others</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -7138,6 +7300,7 @@ export default function AdminPanelPage() {
           <div className="hidden md:block w-full pb-1">
             <TabsList className="flex h-auto min-h-11 w-full flex-wrap gap-1 rounded-xl border border-border/70 bg-muted/30 p-1 shadow-sm [&_[data-slot=tabs-trigger]]:h-9 [&_[data-slot=tabs-trigger]]:shrink-0 [&_[data-slot=tabs-trigger]]:px-2 [&_[data-slot=tabs-trigger]]:text-sm [&_[data-slot=tabs-trigger]]:font-medium [&_[data-slot=tabs-trigger]]:text-muted-foreground [&_[data-slot=tabs-trigger][data-state=active]]:bg-background [&_[data-slot=tabs-trigger][data-state=active]]:text-foreground [&_[data-slot=tabs-trigger][data-state=active]]:border-border/80">
             <TabsTrigger value="overview">Overview</TabsTrigger>
+            <TabsTrigger value="customer-journey">Customer Journey</TabsTrigger>
             <TabsTrigger value="calling-reports">Calling Reports</TabsTrigger>
             <TabsTrigger value="visitor-reports">Visitor Reports</TabsTrigger>
             <TabsTrigger
@@ -7179,9 +7342,7 @@ export default function AdminPanelPage() {
             </TabsTrigger>
             <TabsTrigger value="dealers">Users</TabsTrigger>
             <TabsTrigger value="customers">Customers</TabsTrigger>
-            <TabsTrigger value="visitors">Visitors</TabsTrigger>
             <TabsTrigger value="catalog">Catalog</TabsTrigger>
-            <TabsTrigger value="account-management">Others</TabsTrigger>
             </TabsList>
           </div>
 
@@ -7421,6 +7582,30 @@ export default function AdminPanelPage() {
               useApi={useApi}
               enabled={activeTab === "overview"}
               refreshToken={productNeededRefreshToken}
+            />
+          </TabsContent>
+
+          <TabsContent value="customer-journey" className="space-y-4">
+            <FullCustomerJourneyPanel
+              quotations={quotations}
+              callingActions={journeyCallingActions}
+              title="Customer Journey"
+              description="Stores and shows the full path: Calling Data → Calling Action → Quotation → Admin Approval → Installation → Metering → Final Confirmation. Expand a row for the timeline."
+              emptyMessage="No journey records yet. Calling actions and quotations will appear here once available."
+              showDealerDetails
+              dealers={activeDealers.map((d) => ({
+                id: d.id,
+                label: `${d.firstName || ""} ${d.lastName || ""}`.trim() || d.username || d.id,
+              }))}
+              isLoading={isJourneyCallingActionsLoading && journeyCallingActions.length === 0}
+              onSearchChange={handleJourneySearchChange}
+              resolveDealerDetails={(quotation, rowDealerId) => {
+                const dealerId = quotation?.dealerId || rowDealerId || ""
+                return {
+                  name: getDealerName(dealerId, quotation),
+                  mobile: getDealerMobile(dealerId, quotation),
+                }
+              }}
             />
           </TabsContent>
 
@@ -12796,7 +12981,7 @@ export default function AdminPanelPage() {
                     Check the dashboards this user can open after login.
                   </p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {USER_ACCESS_OPTIONS.map((opt) => {
+                    {ASSIGNABLE_USER_ACCESS_OPTIONS.map((opt) => {
                       const checked = dealerEditForm.access.includes(opt.key)
                       return (
                         <label
@@ -13472,7 +13657,7 @@ export default function AdminPanelPage() {
                   Check the dashboards this user can open after login. Multiple boxes allowed.
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {USER_ACCESS_OPTIONS.map((opt) => {
+                  {ASSIGNABLE_USER_ACCESS_OPTIONS.map((opt) => {
                     const checked = newAccountManager.access.includes(opt.key)
                     return (
                       <label
@@ -15407,12 +15592,16 @@ export default function AdminPanelPage() {
                   />
                   {(() => {
                     const q = adminMeteringSelectedQuotation as any
+                    const fromRow = readQuotationMeterDocument(q)
                     const savedUrl =
-                      q?.meterDocumentPublicUrl ||
-                      q?.meter_document_public_url ||
-                      q?.meterDocumentUrl ||
-                      q?.meter_document_url
-                    const savedName = q?.meterDocumentName || q?.meter_document_name
+                      fromRow.url ||
+                      toMeterDocumentPublicViewUrl(
+                        q?.meterDocumentPublicUrl ||
+                          q?.meter_document_public_url ||
+                          q?.meterDocumentUrl ||
+                          q?.meter_document_url,
+                      )
+                    const savedName = fromRow.name || q?.meterDocumentName || q?.meter_document_name
                     const localFile = adminMeteringQuotationId
                       ? adminMeteringDocByQuotation[adminMeteringQuotationId]
                       : null

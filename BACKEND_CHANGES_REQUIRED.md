@@ -1124,12 +1124,14 @@ Fields expected from frontend modal:
 - `remarks` (string, optional) — Admin Meter Pending / Meter in Discom card field
 - `authorizedRepresentative` / `authorized_representative` (string, optional)
 - `meterDocumentImage` (file, optional/required as per business rule)
+- **Also accept file field aliases (Aug 2026 SPA):** `meter_document_image`, `meterDocument`, `meter_document`, `meterDocumentFile`, `file`
 
 Behavior:
 - Persist these values in quotation metering fields (or a `quotation_metering_details` table linked by quotation id).
 - Store uploaded `meterDocumentImage` in S3 and persist URL/metadata.
 - Return saved values in response so UI can rehydrate after refresh (include `remarks`, `authorizedRepresentative` on list/detail GET).
 - **Public / browsable meter document URL (required for Admin + Metering modals):** Do **not** return only a private virtual-hosted S3 URL (`https://{bucket}.s3.{region}.amazonaws.com/...`) — browsers get **Access Denied**. Return **`meterDocumentPublicUrl`** (presigned GET or CDN URL) and duplicate as **`meterDocumentUrl`** when needed. Same rules as **§6.4.C.8** (installation photos). On **`GET /api/admin/quotations`** and **`GET /api/metering/quotations`**, include `meterDocumentUrl` / `meterDocumentPublicUrl` / `meterDocumentName` on each row so **Metering Details** shows thumbnail + **Open link** after refresh.
+- **Aug 2026 implementable handoff:** **`BACKEND_METER_DOCUMENT_PUBLIC_URL.ts`**, **`BACKEND_CHANGES_HANDOFF.md` §33**, **§AF** below.
 - Full Jul 2026 handoff: **`BACKEND_INSTALLATION_PARTIAL_AND_METERING.md`**.
 
 **RBAC (fixes `AUTH_004` / “Insufficient permissions” on Save Details):**  
@@ -5342,3 +5344,81 @@ For questions or clarifications about these requirements, please refer to:
 - Admin Quotations tab Send to Metering: `lib/api.ts` → `sendQuotationToMetering`, **`BACKEND_CHANGES_REQUIRED.md` §L.1**, **`BACKEND_CHANGES_HANDOFF.md` §11**
 - API specification: `API_SPECIFICATION.txt`
 - Endpoints summary: `API_ENDPOINTS_SUMMARY.md`
+
+---
+
+## §AE — Customer Journey (Calling → Final Confirmation) — Aug 2026
+
+**Frontend:** Admin **Customer Journey** tab + dealer `/dashboard/customer-journey`.  
+**Reference:** `BACKEND_CUSTOMER_JOURNEY.ts`, `lib/full-customer-journey.ts`, `lib/journey-calling-actions.ts`.
+
+### Required (no new endpoint strictly required)
+
+| Item | Detail |
+|------|--------|
+| Calling-actions list | Dealer + Admin GET honour `range=all` and `limit` up to ≥2000 |
+| Action row fields | `leadId`, `mobile`, `action`, `actionAt`, `callRemark`, `statusText`, `statusCategory`, `dealerId`, `dealerName` |
+| Queue payload | Include `dialledActions` / `connectedActions` / `notConnectedActions` / `recentActions` |
+| Quotation link | Persist `callingLeadId` from Calling Data prefill; echo on GET |
+| Search | Last-10 digit mobile match + name / leadId / quotationId |
+
+### Optional dedicated API
+
+```
+GET /api/admin/customer-journey
+GET /api/dealers/me/customer-journey
+```
+
+Query: `search`, `dealerId` (admin), `startDate`, `endDate`, `source`, `connection`, `outcome`, `page`, `limit`.
+
+Response rows: `stages`, `stageDates`, `timeline`, `leadId`, `quotationId`, dealer fields.
+
+### Schema
+
+```sql
+ALTER TABLE quotations
+  ADD COLUMN IF NOT EXISTS calling_lead_id UUID NULL;
+CREATE INDEX IF NOT EXISTS idx_quotations_calling_lead_id
+  ON quotations (calling_lead_id);
+```
+
+### Stage completion (calling)
+
+- No matching action rows → Calling Data / Calling Action **Pending**
+- Submitted action (`called` / `follow_up` / `not_interested` / `rescheduled`) → Calling Data **Completed**; Calling Action **Completed** (or In Progress if follow-up/start)
+
+### Checklist
+
+- [x] Action history complete for dealer + admin
+- [x] `callingLeadId` on quotation create + GET
+- [x] Queue buckets present
+- [ ] QA mobile search shows Calling stages Completed when history exists
+
+---
+
+## §AF — Meter Document public view link (Metering Details) — Aug 2026
+
+**Frontend:** Admin / Metering **Metering Details** modal — upload PDF/image must show **Open public link** after save.  
+**Reference:** `BACKEND_METER_DOCUMENT_PUBLIC_URL.ts`, HANDOFF **§33**, existing §J.
+
+### Required
+
+| Item | Detail |
+|------|--------|
+| Endpoint | `POST /api/metering/quotations/{id}/details` (fallback `…/metering-details`) |
+| Multipart file | Accept `meterDocumentImage` **plus** aliases: `meter_document_image`, `meterDocument`, `meter_document`, `meterDocumentFile`, `file` |
+| Auth | Roles **`metering`** and **`admin`** (fix AUTH_004 for metering JWT) |
+| Storage | S3 key `metering/{quotationId}/{ts}-{uuid}.{ext}`; persist key + original name |
+| Save response | `meterDocumentPublicUrl` + `meterDocumentUrl` + `meterDocumentName` (presigned GET or CDN — **not** private bare S3 URL) |
+| List GET | Admin + metering quotation lists must echo those three fields; **re-presign** from key if expired |
+
+### Do not
+
+- Return only `https://{bucket}.s3.{region}.amazonaws.com/{key}` without signature / public-read
+- Restrict the POST to admin-only middleware
+
+### Checklist
+
+- [x] Multipart aliases accepted
+- [x] Presigned/CDN public URL on save + list GET
+- [ ] QA: upload PDF → Save → reopen → Open public link works after refresh

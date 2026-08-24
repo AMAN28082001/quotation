@@ -3216,3 +3216,81 @@ Submit installments with total paid = AM subtotal → **200**. Refresh → phase
 | **`BACKEND_NON_DCR_80KW.md`** | **§19** full 80kW set prices, range keys, pricing-tables |
 | **`BACKEND_SUPER_ADMIN_QUOTATION_LOGIN.ts`** | Super-admin `/auth/login` + shared JWT for inventory |
 | **`BACKEND_INSTALLATION_RELEASE.md`** | **BLOCKER:** Installation tab — PATCH release + GET list fields + QA curls |
+| **§32** (this file) | Customer Journey — calling history + `callingLeadId` link |
+| **`BACKEND_CUSTOMER_JOURNEY.ts`** | **§32 / §AE** full Customer Journey backend spec |
+| **`BACKEND_CHANGES_REQUIRED.md` §AE** | **§32** checklist + schema |
+| **`BACKEND_METER_DOCUMENT_PUBLIC_URL.ts`** | **§33 / §AF** meter document public view link |
+| **`BACKEND_CHANGES_REQUIRED.md` §AF** | **§33** checklist |
+
+---
+
+## 32. Customer Journey tab (Calling Data → Final Confirmation) — Aug 2026
+
+### Frontend
+
+- Admin → **Customer Journey** tab
+- Dealer → `/dashboard/customer-journey`
+- Merge logic: `lib/full-customer-journey.ts`, `lib/journey-calling-actions.ts`
+- Filters modal + scroll load: `components/full-customer-journey-panel.tsx`
+
+### Problem
+
+Quotations that came from Calling Data show later stages complete, but **Calling Data** / **Calling Action** stay Pending because action history is missing, incomplete, or not matchable (no `mobile` / `leadId` / `callingLeadId`).
+
+### Backend must do
+
+1. **Calling-actions GET** (dealer + admin) with `range=all` + high `limit` returns full history rows.
+2. Every action row includes: `id`, `leadId`, `mobile`, `name`, `dealerId`, `dealerName`, `action`, `actionAt`, `callRemark`, `statusText`, `statusCategory`, `nextFollowUpAt?`.
+3. **Queue GET** (`/calling-queue/current` / `/next`) includes `dialledActions` / `connectedActions` / `notConnectedActions` / `recentActions` (same row shape).
+4. On quotation create from Calling Data prefill, persist **`callingLeadId`** and echo it on quotation list/detail GET.
+5. Mobile match: store clean digits; search compares last 10 digits.
+
+### Optional (scale)
+
+`GET /api/admin/customer-journey` and `GET /api/dealers/me/customer-journey` — pre-merged rows with `stages` + `stageDates` + `timeline`.
+
+### Docs
+
+- Full spec: **`BACKEND_CUSTOMER_JOURNEY.ts`**
+- Also: **`BACKEND_CHANGES_REQUIRED.md` §AE**
+
+### QA
+
+1. Call lead → Submit → Create Quotation Prefill → save.
+2. Customer Journey search by mobile → Calling Data + Calling Action **Completed** with dates.
+3. Admin same mobile → same calling stages + dealer filter works.
+
+---
+
+## 33. Metering Details — meter document public view link (Aug 2026)
+
+### Frontend
+
+- Admin Metering → **Metering Details** modal (file: image/pdf)
+- Metering dashboard → same modal
+- Client: `api.metering.saveDetails`, `lib/parse-api-media.ts`, `StoredMediaPreview`
+
+### Problem
+
+Upload + Save still shows **“No meter document on file yet.”** because the API does not return a **browser-openable** `meterDocumentPublicUrl` (or list GET omits it). Private S3 object URLs → Access Denied.
+
+### Backend must do
+
+| Priority | Change |
+|----------|--------|
+| **P0** | `POST /api/metering/quotations/:id/details` accept file under `meterDocumentImage` **and** aliases (`meterDocument`, `meter_document`, `file`, …) |
+| **P0** | Upload to S3; persist `meter_document_key` + `meter_document_name` |
+| **P0** | Save response includes **`meterDocumentPublicUrl`** (presigned ≥7d or CDN) + `meterDocumentUrl` + `meterDocumentName` |
+| **P0** | Roles: **`metering` + `admin`** (not admin-only) |
+| **P0** | `GET /api/admin/quotations` + `GET /api/metering/quotations` echo the same three fields (re-presign from key on each GET) |
+
+### Docs
+
+- Full spec + handler: **`BACKEND_METER_DOCUMENT_PUBLIC_URL.ts`**
+- Also: **`BACKEND_CHANGES_REQUIRED.md` §AF** (and existing §J)
+
+### QA
+
+1. Upload PDF in Metering Details → Save.
+2. Reopen modal → **Open public link** visible and opens the file.
+3. Hard refresh → link still works.

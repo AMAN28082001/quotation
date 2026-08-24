@@ -530,11 +530,11 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
   )
   const acdbOptionsList = useMemo(() => {
     const merged = [...new Set([...acdbDcdbOptionLists.acdb, formData.acdb].filter(Boolean))]
-    return merged.length > 0 ? merged : [formatACDBOption("Havells", currentPhase)]
+    return merged.length > 0 ? merged : [formatACDBOption("Havells+Elmex", currentPhase)]
   }, [acdbDcdbOptionLists.acdb, formData.acdb, currentPhase])
   const dcdbOptionsList = useMemo(() => {
     const merged = [...new Set([...acdbDcdbOptionLists.dcdb, formData.dcdb].filter(Boolean))]
-    return merged.length > 0 ? merged : [formatDCDBOption("Havells", currentPhase)]
+    return merged.length > 0 ? merged : [formatDCDBOption("Elmex", currentPhase)]
   }, [acdbDcdbOptionLists.dcdb, formData.dcdb, currentPhase])
 
   // Ensure non-dcr systems always have 0 subsidies
@@ -834,8 +834,8 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
           : systemConfig.phase === "1-Phase" || systemConfig.phase === "3-Phase"
             ? (systemConfig.phase as "1-Phase" | "3-Phase")
             : "3-Phase"
-      const baseAcdb = systemConfig.acdb || preFilledData.acdb || formatACDBOption("Havells", effPhase)
-      const baseDcdb = systemConfig.dcdb || preFilledData.dcdb || formatDCDBOption("Havells", effPhase)
+      const baseAcdb = systemConfig.acdb || preFilledData.acdb || formatACDBOption("Havells+Elmex", effPhase)
+      const baseDcdb = systemConfig.dcdb || preFilledData.dcdb || formatDCDBOption("Elmex", effPhase)
       const acdbForPhase = baseAcdb.replace(/\((1-Phase|3-Phase)\)/, `(${effPhase})`)
       const dcdbForPhase = baseDcdb.replace(/\((1-Phase|3-Phase)\)/, `(${effPhase})`)
       
@@ -898,8 +898,8 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
       
       const bothPhase: "1-Phase" | "3-Phase" =
         config.phase === "1-Phase" || config.phase === "3-Phase" ? config.phase : "3-Phase"
-      const defaultAcdb = formatACDBOption("Havells", bothPhase)
-      const defaultDcdb = formatDCDBOption("Havells", bothPhase)
+      const defaultAcdb = formatACDBOption("Havells+Elmex", bothPhase)
+      const defaultDcdb = formatDCDBOption("Elmex", bothPhase)
       
       setFormData((prev) => ({
         ...prev,
@@ -1016,8 +1016,8 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
 
       const systemSizeForPhase = `${systemKw}kW`
       const fallbackPhase = determinePhase(systemSizeForPhase, config.inverterSize, pricingTables || undefined)
-      const defaultAcdb = formatACDBOption("Havells", fallbackPhase)
-      const defaultDcdb = formatDCDBOption("Havells", fallbackPhase)
+      const defaultAcdb = formatACDBOption("Havells+Elmex", fallbackPhase)
+      const defaultDcdb = formatDCDBOption("Elmex", fallbackPhase)
       const pdfRangeKey =
         config.systemSize === "80kW"
           ? (defaultPdfPanelRangeKeyForNonDcr80KwPackage(panelBrand) ?? "")
@@ -1105,7 +1105,7 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
         effPhase,
         systemConfig.acdb || preFilledData.acdb || (isCromptonSet ? "Crompton (1-Phase)" : undefined),
         systemConfig.dcdb || preFilledData.dcdb || (isCromptonSet ? "Crompton (1-Phase)" : undefined),
-        isCromptonSet ? "Crompton" : "Havells",
+        isCromptonSet ? "Crompton" : undefined,
       )
       const pdfRangeKey = isTataPackage
         ? TATA_DCR_PANEL_RANGE_KEY
@@ -1376,7 +1376,7 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
   /** Commercial PDF set: hide subsidy inputs (also omit from proposal PDF). */
   const showSubsidyFields = !Boolean(formData.pdfCommercialSet)
 
-  // Auto-select Havells (1-Phase) / Havells (3-Phase) when package phase is known
+  // Auto-select Havells+Elmex / Elmex ACDB/DCDB when package phase is known
   useEffect(() => {
     if (!hasSelectedStandardConfig && !showBothFields) return
 
@@ -1749,8 +1749,8 @@ export function ProductSelectionForm({ onSubmit, onBack, initialData }: Props) {
                           return {
                             ...prev,
                             phase: p,
-                            acdb: swap(prev.acdb) || formatACDBOption("Havells", p),
-                            dcdb: swap(prev.dcdb) || formatDCDBOption("Havells", p),
+                            acdb: swap(prev.acdb) || formatACDBOption("Havells+Elmex", p),
+                            dcdb: swap(prev.dcdb) || formatDCDBOption("Elmex", p),
                           }
                         })
                       }}

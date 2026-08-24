@@ -69,6 +69,14 @@ export function StoredMediaPreview({ rawUrl, localFile, quotationId, fileName, c
   return (
     <div className={className}>
       <InstallationPublicPhoto rawUrl={url} quotationId={quotationId} />
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="mt-1 inline-block text-[11px] font-medium text-primary underline break-all"
+      >
+        Open public link
+      </a>
       {displayName ? <p className="mt-1 text-[10px] text-muted-foreground truncate">{displayName}</p> : null}
     </div>
   )
@@ -93,7 +101,7 @@ function PdfPublicLink({
     setLoading(true)
     void resolvePublicOpenMediaUrl(rawUrl, quotationId).then((resolved) => {
       if (!cancelled) {
-        setHref(resolved)
+        setHref(resolved || rawUrl)
         setLoading(false)
       }
     })
@@ -111,7 +119,8 @@ function PdfPublicLink({
     )
   }
 
-  if (!href) return null
+  const openHref = href || rawUrl
+  if (!openHref) return null
 
   return (
     <div className={cn("rounded-md border border-border/60 bg-muted/30 p-3 space-y-2", className)}>
@@ -120,13 +129,13 @@ function PdfPublicLink({
         <span className="truncate">{fileName}</span>
       </div>
       <a
-        href={href}
+        href={openHref}
         target="_blank"
         rel="noopener noreferrer"
         className="text-[11px] font-medium text-primary underline break-all"
-        title={href}
+        title={openHref}
       >
-        Open link
+        Open public link
       </a>
     </div>
   )

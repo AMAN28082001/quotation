@@ -71,6 +71,11 @@ export const USER_ACCESS_OPTIONS: UserAccessOption[] = [
   },
 ]
 
+/** Admin → Users create/edit checkboxes. Admin access is not granted from this form. */
+export const ASSIGNABLE_USER_ACCESS_OPTIONS: UserAccessOption[] = USER_ACCESS_OPTIONS.filter(
+  (option) => option.key !== "admin",
+)
+
 const ACCESS_SET = new Set<string>(USER_ACCESS_OPTIONS.map((o) => o.key))
 
 const STORAGE_KEY = "userAccessOverrides"

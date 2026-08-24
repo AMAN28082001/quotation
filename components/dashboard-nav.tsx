@@ -24,7 +24,7 @@ import { SolarLogo } from "@/components/solar-logo"
 import { PricingSheetViewDialog } from "@/components/pricing-sheet-view-dialog"
 import { PRICING_PDF_SCOPE_OPTIONS, type PricingPdfScope } from "@/lib/download-dcr-pricing-pdf"
 import { usePricingTables } from "@/lib/use-pricing-tables"
-import { Menu, Home, Users, FileText, LogOut, User, Shield, PhoneCall, Eye, ChevronDown, Wallet } from "lucide-react"
+import { Menu, Home, Users, FileText, LogOut, User, Shield, PhoneCall, Eye, ChevronDown, Wallet, Route } from "lucide-react"
 import { isQuotationAdminAccess } from "@/lib/admin-access"
 import { canOpenSection, getAccessOptions, type UserAccessKey } from "@/lib/user-access"
 import { cn } from "@/lib/utils"
@@ -35,6 +35,7 @@ const isQuotationAppPath = (pathname: string) =>
   pathname.startsWith("/dashboard/quotations") ||
   pathname.startsWith("/dashboard/payments") ||
   pathname.startsWith("/dashboard/calling-data") ||
+  pathname.startsWith("/dashboard/customer-journey") ||
   pathname.startsWith("/dashboard/new-quotation")
 
 const isAccessSectionActive = (key: UserAccessKey, pathname: string) => {
@@ -50,6 +51,7 @@ const dealerNavItems = [
   { href: "/dashboard/quotations", label: "Quotations", icon: FileText },
   { href: "/dashboard/payments", label: "Payments", icon: Wallet },
   { href: "/dashboard/calling-data", label: "Calling Data", icon: PhoneCall },
+  { href: "/dashboard/customer-journey", label: "Customer Journey", icon: Route },
 ]
 
 const getNavItems = (isAdmin: boolean, role: string | null, access: UserAccessKey[], pathname: string) => {
@@ -184,7 +186,7 @@ export function DashboardNav() {
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="h-8 gap-1.5 shrink-0 text-xs"
+                    className="h-7 gap-1 shrink-0 text-[11px] px-2"
                   >
                     {currentAccessLabel}
                     <ChevronDown className="w-3.5 h-3.5 opacity-70" />
@@ -204,18 +206,21 @@ export function DashboardNav() {
               </DropdownMenu>
             ) : null}
 
-            {/* Page links — scroll if needed, never overlap logo */}
-            <nav className="hidden md:flex items-center gap-1 min-w-0 flex-1 overflow-x-auto">
+            {/* Page links — compact so all items fit without horizontal scroll */}
+            <nav className="hidden md:flex items-center gap-0.5 min-w-0 flex-1 overflow-x-hidden">
               {navItems.map((item) => (
                 <Button
                   key={item.href}
                   variant={pathname === item.href ? "default" : "ghost"}
                   size="sm"
                   onClick={() => router.push(item.href)}
-                  className={`gap-2 shrink-0 h-8 ${pathname === item.href ? "" : "text-muted-foreground hover:text-foreground"}`}
+                  className={cn(
+                    "gap-1 shrink-0 h-7 px-2 text-[11px] font-medium leading-none",
+                    pathname === item.href ? "" : "text-muted-foreground hover:text-foreground",
+                  )}
                 >
-                  <item.icon className="w-4 h-4" />
-                  {item.label}
+                  <item.icon className="w-3.5 h-3.5 shrink-0" />
+                  <span className="whitespace-nowrap">{item.label}</span>
                 </Button>
               ))}
               {showDealerActions ? (
@@ -225,11 +230,11 @@ export function DashboardNav() {
                       type="button"
                       variant="ghost"
                       size="sm"
-                      className="gap-1.5 text-muted-foreground hover:text-foreground shrink-0 h-8"
+                      className="gap-1 text-muted-foreground hover:text-foreground shrink-0 h-7 px-2 text-[11px] font-medium leading-none"
                     >
-                      <Eye className="w-4 h-4" />
+                      <Eye className="w-3.5 h-3.5 shrink-0" />
                       Pricing
-                      <ChevronDown className="w-3.5 h-3.5 opacity-70" />
+                      <ChevronDown className="w-3 h-3 opacity-70 shrink-0" />
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
@@ -251,11 +256,11 @@ export function DashboardNav() {
             <div className="flex items-center gap-1 sm:gap-2 shrink-0 ml-auto">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm" className="gap-2 h-8">
-                    <div className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20">
-                      <User className="w-3.5 h-3.5 text-primary" />
+                  <Button variant="ghost" size="sm" className="gap-1.5 h-7 px-2">
+                    <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20">
+                      <User className="w-3 h-3 text-primary" />
                     </div>
-                    <span className="hidden lg:block font-medium text-sm">
+                    <span className="hidden xl:block font-medium text-[11px]">
                       {dealer?.firstName} {dealer?.lastName}
                     </span>
                   </Button>

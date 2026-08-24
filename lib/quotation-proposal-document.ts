@@ -546,7 +546,7 @@ export function buildSpecRows(products: ProductSelection | ProductsLike): SpecRo
           ? `${QUOTATION_AS_PER_THE_SET_LABEL} / ${QUOTATION_AS_PER_THE_SET_LABEL}`
           : p.acdb || p.dcdb
             ? `${p.acdb || ""} ${p.dcdb || ""}`.trim()
-            : "Havells MCB",
+            : "Havells+Elmex / Elmex",
       qty: "1 Set",
     },
     {

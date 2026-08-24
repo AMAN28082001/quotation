@@ -1045,6 +1045,7 @@ export const api = {
         page?: number
         limit?: number
         dealerId?: string
+        search?: string
         startDate?: string
         endDate?: string
         range?: "daily" | "weekly" | "monthly" | "last_month" | "all" | "custom"
@@ -3087,7 +3088,14 @@ export const api = {
         formData.append("discomLocation", payload.discomLocation)
         formData.append("discom_location", payload.discomLocation)
       }
-      if (meterDocumentFile) formData.append("meterDocumentImage", meterDocumentFile)
+      if (meterDocumentFile) {
+        formData.append("meterDocumentImage", meterDocumentFile)
+        formData.append("meter_document_image", meterDocumentFile)
+        formData.append("meterDocument", meterDocumentFile)
+        formData.append("meter_document", meterDocumentFile)
+        formData.append("meterDocumentFile", meterDocumentFile)
+        formData.append("file", meterDocumentFile)
+      }
       if (payload.meterInstallationPhoto) {
         formData.append("meterInstallationPhoto", payload.meterInstallationPhoto)
         formData.append("meter_installation_photo", payload.meterInstallationPhoto)
@@ -3379,6 +3387,7 @@ export const api = {
         page?: number
         limit?: number
         dealerId?: string
+        search?: string
         startDate?: string
         endDate?: string
         range?: "daily" | "weekly" | "monthly" | "last_month" | "all" | "custom"
@@ -3690,6 +3699,7 @@ export const api = {
         page?: number
         limit?: number
         dealerId?: string
+        search?: string
         startDate?: string
         endDate?: string
         range?: "daily" | "weekly" | "monthly" | "last_month" | "all" | "custom"

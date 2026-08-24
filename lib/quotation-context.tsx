@@ -816,6 +816,10 @@ export function QuotationProvider({ children }: { children: ReactNode }) {
         // Create quotation payload - matching backend controller expectations
         // Backend expects these fields at root level: subtotal, totalAmount, finalAmount
         // Variable names must match backend exactly
+        const prefillLeadId =
+          typeof window !== "undefined"
+            ? new URLSearchParams(window.location.search).get("prefillLeadId")?.trim() || ""
+            : ""
         const quotationData = {
           customerId,
           customer: currentCustomer,
@@ -830,6 +834,15 @@ export function QuotationProvider({ children }: { children: ReactNode }) {
           totalSubsidy: validatedTotalSubsidy, // Total subsidy (central + state)
           amountAfterSubsidy: validatedAmountAfterSubsidy, // Amount after subsidy
           discountAmount: validatedDiscountAmount, // Discount amount
+          // Customer Journey (§AE): link quotation to Calling Data lead
+          ...(prefillLeadId
+            ? {
+                callingLeadId: prefillLeadId,
+                calling_lead_id: prefillLeadId,
+                prefillLeadId,
+                leadId: prefillLeadId,
+              }
+            : {}),
           // Commercial set (DCR/BOTH without subsidy): backend must skip the centralSubsidy
           // requirement and not deduct subsidy (finalAmount = subtotal - discount).
           ...(isCommercialSet
