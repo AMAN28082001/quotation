@@ -340,7 +340,28 @@ export function getSystemKwLabel(products: ProductSelection): string {
   return getQuotationSystemKwLabelForPdf(products)
 }
 
-export function getSystemTypeLabel(systemType: string): string {
+export function isHybridInverterType(inverterType?: string | null): boolean {
+  return /hybrid/i.test(String(inverterType || "").trim())
+}
+
+/** Same brand/model string shown on the Solar Inverter PDF spec row. */
+export function resolveInverterBrandForPdf(products: ProductsLike): string {
+  const raw = products as Record<string, unknown>
+  const brand = pickNonEmpty(products.inverterBrand, raw.inverter_brand)
+  const size = pickNonEmpty(products.inverterSize, raw.inverter_size)
+  if (isAsPerTheSetLabel(brand) || isAsPerTheSetLabel(size)) {
+    return QUOTATION_AS_PER_THE_SET_LABEL
+  }
+  return normalizeInverterBrandForDisplay(brand) || "Vsole/Xwatt"
+}
+
+export function getSystemTypeLabel(
+  systemType: string,
+  inverterType?: string | null,
+): string {
+  if (isHybridInverterType(inverterType)) {
+    return "Hybrid Solar system"
+  }
   const map: Record<string, string> = {
     dcr: "On-Grid DCR Solar System",
     "non-dcr": "On-Grid Non-DCR Solar System",
@@ -450,10 +471,7 @@ export function buildSpecRows(products: ProductSelection | ProductsLike): SpecRo
     ? QUOTATION_AS_PER_THE_SET_LABEL
     : p.inverterSize || "—"
   const invSpec = `${invSizeForSpec} ${p.inverterType || "String Inverter"}, ${formatQuotationPhaseLabel(resolveQuotationPhase(p))}, MPPT, IP65, Wi-Fi Monitoring`
-  const invBrand =
-    isAsPerTheSetLabel(p.inverterBrand) || isAsPerTheSetLabel(p.inverterSize)
-      ? QUOTATION_AS_PER_THE_SET_LABEL
-      : normalizeInverterBrandForDisplay(p.inverterBrand) || "Vsole/Xwatt"
+  const invBrand = resolveInverterBrandForPdf(p)
   const dcrBrandForBoth = pickNonEmpty(
     p.dcrPanelBrand,
     (p as Record<string, unknown>).dcr_panel_brand,
@@ -776,8 +794,9 @@ export function buildSubsidyTermsDetail(products: ProductsLike): string {
     .join("\n\n")
 }
 
-export function buildWarrantyRows(panelBrand: string): WarrantyRow[] {
+export function buildWarrantyRows(panelBrand: string, inverterBrand?: string): WarrantyRow[] {
   const brandLabel = panelBrand || "Selected brand"
+  const inverterLabel = String(inverterBrand || "").trim() || "Vsole/Xwatt"
   return [
     {
       component: `Solar Panels (${brandLabel})`,
@@ -785,7 +804,7 @@ export function buildWarrantyRows(panelBrand: string): WarrantyRow[] {
       coverage: "Linear Power Output Guarantee",
     },
     {
-      component: "GTI Inverter (Vsol/Xwatt)",
+      component: `GTI Inverter (${inverterLabel})`,
       period: "8–10 Years",
       coverage: "Manufacturing Defects",
     },
@@ -905,7 +924,10 @@ export function buildQuotationProposalDocumentData(params: {
   const phaseLabel = formatQuotationPhaseLabel(resolveQuotationPhase(products))
   const systemKwLabel = getSystemKwLabel(products)
   const panelBrand = resolvePanelBrandForPdf(products)
+  const inverterBrand = resolveInverterBrandForPdf(products)
   const pricingTotal = getPricingTotalForPdf(params.subtotal, products)
+  const rawProducts = products as Record<string, unknown>
+  const inverterType = pickNonEmpty(products.inverterType, rawProducts.inverter_type)
 
   return {
     quotationId: params.quotationId,
@@ -926,7 +948,7 @@ export function buildQuotationProposalDocumentData(params: {
     totalAmount: params.totalAmount,
     systemKwLabel,
     phaseLabel,
-    systemTypeLabel: getSystemTypeLabel(products.systemType),
+    systemTypeLabel: getSystemTypeLabel(products.systemType, inverterType),
     specRows: buildSpecRows(products),
     panelNote: buildPanelTechnologyNote(products),
     showPricingRateColumn: shouldShowPricingRateColumn(undefined, products),
@@ -934,7 +956,7 @@ export function buildQuotationProposalDocumentData(params: {
     pricingTotalLabel: pricingTotal.label,
     pricingTotalAmount: pricingTotal.amount,
     paymentRows: buildPaymentRows(params.subtotal),
-    warrantyRows: buildWarrantyRows(panelBrand),
+    warrantyRows: buildWarrantyRows(panelBrand, inverterBrand),
     supportLine: buildAfterSalesSupportLine(params.company),
     termsRows: buildTermsRows(products, panelBrand),
     page2CompactFont: shouldUseCompactPage2PdfFont(products),

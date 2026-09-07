@@ -19,7 +19,12 @@ import {
 import { ChevronDown, ChevronRight, Filter, Search } from "lucide-react"
 import { formatYmdLocal } from "@/lib/calling-report-date-range"
 import { formatPersonName } from "@/lib/name-display"
-import type { JourneyDateRangeFilter, JourneyStageStatus } from "@/lib/customer-journey"
+import {
+  getJourneyDateRangeBounds,
+  matchesJourneyDateRangeFilter,
+  type JourneyDateRangeFilter,
+  type JourneyStageStatus,
+} from "@/lib/customer-journey"
 import {
   buildFullCustomerJourneyRows,
   formatFullJourneyStageLabel,
@@ -44,6 +49,8 @@ import {
 import { useIncrementalList } from "@/hooks/use-incremental-list"
 import { IncrementalListSentinel } from "@/components/incremental-list-sentinel"
 
+const JOURNEY_LIST_BATCH_SIZE = 20
+
 function statusBadgeClass(status: JourneyStageStatus) {
   if (status === "completed") return "bg-green-600 text-white"
   if (status === "in_progress") return "bg-amber-500 text-white"
@@ -65,6 +72,12 @@ type JourneyDealerOption = {
   label: string
 }
 
+export type JourneyDateRangeChange = {
+  dateFilter: JourneyDateRangeFilter
+  customFromDate: string
+  customToDate: string
+}
+
 type FullCustomerJourneyPanelProps = {
   quotations: Quotation[]
   callingActions: JourneyCallingAction[]
@@ -82,6 +95,10 @@ type FullCustomerJourneyPanelProps = {
   isLoading?: boolean
   /** Parent can fetch extra calling-actions for this search (e.g. by mobile). */
   onSearchChange?: (term: string) => void
+  /** Notify parent when date filter changes so it can load a scoped API range. */
+  onDateRangeChange?: (range: JourneyDateRangeChange) => void
+  /** Initial date filter (defaults to Today for fast first paint). */
+  initialDateFilter?: JourneyDateRangeFilter
 }
 
 export function FullCustomerJourneyPanel({
@@ -96,9 +113,11 @@ export function FullCustomerJourneyPanel({
   resolveDealerDetails,
   isLoading = false,
   onSearchChange,
+  onDateRangeChange,
+  initialDateFilter = "today",
 }: FullCustomerJourneyPanelProps) {
   const [searchTerm, setSearchTerm] = useState("")
-  const [dateFilter, setDateFilter] = useState<JourneyDateRangeFilter>("all")
+  const [dateFilter, setDateFilter] = useState<JourneyDateRangeFilter>(initialDateFilter)
   const [customFromDate, setCustomFromDate] = useState("")
   const [customToDate, setCustomToDate] = useState("")
   const [callingSourceFilter, setCallingSourceFilter] = useState<JourneyCallingSourceFilter>("all")
@@ -108,6 +127,7 @@ export function FullCustomerJourneyPanel({
   const [filtersOpen, setFiltersOpen] = useState(false)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const scrollRootRef = useRef<HTMLDivElement | null>(null)
+  const lastNotifiedRangeRef = useRef("")
 
   const showDealerFilter = Array.isArray(dealers) && dealers.length > 0
 
@@ -130,8 +150,37 @@ export function FullCustomerJourneyPanel({
     setCustomToDate(today)
   }, [dateFilter, customFromDate, customToDate])
 
+  useEffect(() => {
+    if (!onDateRangeChange) return
+    if (dateFilter === "custom" && (!customFromDate || !customToDate)) return
+    const key = `${dateFilter}|${customFromDate}|${customToDate}`
+    if (lastNotifiedRangeRef.current === key) return
+    lastNotifiedRangeRef.current = key
+    onDateRangeChange({ dateFilter, customFromDate, customToDate })
+  }, [dateFilter, customFromDate, customToDate, onDateRangeChange])
+
+  // Scope inputs before the expensive merge so Today (and other ranges) stay fast.
+  const scopedQuotations = useMemo(() => {
+    if (dateFilter === "all") return quotations
+    return quotations.filter((q) => matchesJourneyDateRangeFilter(q, dateFilter, customFromDate, customToDate))
+  }, [quotations, dateFilter, customFromDate, customToDate])
+
+  const scopedCallingActions = useMemo(() => {
+    if (dateFilter === "all") return callingActions
+    const bounds = getJourneyDateRangeBounds(dateFilter, customFromDate, customToDate)
+    if (!bounds) return callingActions
+    return callingActions.filter((action) => {
+      const d = action.actionAt ? new Date(action.actionAt) : null
+      if (!d || Number.isNaN(d.getTime())) return false
+      return d.getTime() >= bounds.start.getTime() && d.getTime() <= bounds.end.getTime()
+    })
+  }, [callingActions, dateFilter, customFromDate, customToDate])
+
   const rows = useMemo(() => {
-    return buildFullCustomerJourneyRows({ quotations, callingActions })
+    return buildFullCustomerJourneyRows({
+      quotations: scopedQuotations,
+      callingActions: scopedCallingActions,
+    })
       .filter((row) => matchesFullJourneyDateRange(row, dateFilter, customFromDate, customToDate))
       .filter((row) => matchesJourneyCallingSourceFilter(row, callingSourceFilter))
       .filter((row) => matchesJourneyConnectionFilter(row, connectionFilter))
@@ -139,8 +188,8 @@ export function FullCustomerJourneyPanel({
       .filter((row) => matchesJourneyDealerFilter(row, dealerFilter))
       .filter((row) => matchesFullJourneySearch(row, searchTerm))
   }, [
-    quotations,
-    callingActions,
+    scopedQuotations,
+    scopedCallingActions,
     searchTerm,
     dateFilter,
     customFromDate,
@@ -161,6 +210,7 @@ export function FullCustomerJourneyPanel({
     outcomeFilter,
     dealerFilter,
     rows.length,
+    rows[0]?.id ?? "",
   ].join("|")
 
   const {
@@ -171,7 +221,7 @@ export function FullCustomerJourneyPanel({
     loadMore,
     sentinelRef,
   } = useIncrementalList(rows, {
-    batchSize: 15,
+    batchSize: JOURNEY_LIST_BATCH_SIZE,
     resetKey: listResetKey,
     rootRef: scrollRootRef,
     enabled: !isLoading && rows.length > 0,
@@ -202,7 +252,7 @@ export function FullCustomerJourneyPanel({
 
   const clearFilters = () => {
     setSearchTerm("")
-    setDateFilter("all")
+    setDateFilter("today")
     setCustomFromDate("")
     setCustomToDate("")
     setCallingSourceFilter("all")
@@ -212,7 +262,7 @@ export function FullCustomerJourneyPanel({
   }
 
   const clearModalFilters = () => {
-    setDateFilter("all")
+    setDateFilter("today")
     setCustomFromDate("")
     setCustomToDate("")
     setCallingSourceFilter("all")
@@ -225,6 +275,15 @@ export function FullCustomerJourneyPanel({
     dealerFilter === "all"
       ? "All dealers"
       : dealers?.find((d) => d.id === dealerFilter)?.label || "Dealer"
+
+  const dateFilterLabel =
+    dateFilter === "all"
+      ? "All time"
+      : dateFilter === "custom"
+        ? "Custom"
+        : dateFilter === "today"
+          ? "Today"
+          : dateFilter.replace(/_/g, " ")
 
   return (
     <Card>
@@ -244,6 +303,21 @@ export function FullCustomerJourneyPanel({
                 className="pl-9"
               />
             </div>
+            <Select value={dateFilter} onValueChange={(v) => setDateFilter(v as JourneyDateRangeFilter)}>
+              <SelectTrigger className="w-full sm:w-[11rem] shrink-0">
+                <SelectValue placeholder="Date" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="today">Today</SelectItem>
+                <SelectItem value="yesterday">Yesterday</SelectItem>
+                <SelectItem value="week">This week</SelectItem>
+                <SelectItem value="this_month">This month</SelectItem>
+                <SelectItem value="last_month">Last month</SelectItem>
+                <SelectItem value="year">This year</SelectItem>
+                <SelectItem value="custom">Custom date range</SelectItem>
+                <SelectItem value="all">All time</SelectItem>
+              </SelectContent>
+            </Select>
             <Button
               type="button"
               variant="outline"
@@ -259,16 +333,23 @@ export function FullCustomerJourneyPanel({
               ) : null}
             </Button>
           </div>
-          {hasModalFilters ? (
+          {dateFilter === "custom" ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">From</Label>
+                <Input type="date" value={customFromDate} onChange={(e) => setCustomFromDate(e.target.value)} />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">To</Label>
+                <Input type="date" value={customToDate} onChange={(e) => setCustomToDate(e.target.value)} />
+              </div>
+            </div>
+          ) : null}
+          {hasModalFilters || dateFilter !== "all" ? (
             <div className="flex flex-wrap items-center gap-2">
               {dateFilter !== "all" ? (
                 <Badge variant="secondary" className="text-xs font-normal">
-                  Date:{" "}
-                  {dateFilter === "all"
-                    ? "All time"
-                    : dateFilter === "custom"
-                      ? "Custom"
-                      : dateFilter.replace(/_/g, " ")}
+                  Date: {dateFilterLabel}
                 </Badge>
               ) : null}
               {showDealerFilter && dealerFilter !== "all" ? (
@@ -292,7 +373,7 @@ export function FullCustomerJourneyPanel({
                 </Badge>
               ) : null}
               <Button type="button" variant="link" className="h-auto p-0 text-xs" onClick={clearModalFilters}>
-                Clear filters
+                Reset to Today
               </Button>
             </div>
           ) : null}
@@ -303,7 +384,8 @@ export function FullCustomerJourneyPanel({
             <DialogHeader>
               <DialogTitle>Customer Journey Filters</DialogTitle>
               <DialogDescription>
-                Filter by date, dealer, calling source, connection, and calling action.
+                Filter by date, dealer, calling source, connection, and calling action. Lists load 20 rows at a
+                time — scroll for more.
               </DialogDescription>
             </DialogHeader>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
@@ -314,7 +396,6 @@ export function FullCustomerJourneyPanel({
                     <SelectValue placeholder="Date range" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">All time</SelectItem>
                     <SelectItem value="today">Today</SelectItem>
                     <SelectItem value="yesterday">Yesterday</SelectItem>
                     <SelectItem value="week">This week</SelectItem>
@@ -322,6 +403,7 @@ export function FullCustomerJourneyPanel({
                     <SelectItem value="last_month">Last month</SelectItem>
                     <SelectItem value="year">This year</SelectItem>
                     <SelectItem value="custom">Custom date range</SelectItem>
+                    <SelectItem value="all">All time</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -408,7 +490,7 @@ export function FullCustomerJourneyPanel({
             </div>
             <DialogFooter className="gap-2 sm:gap-0">
               <Button type="button" variant="outline" onClick={clearModalFilters}>
-                Clear
+                Reset to Today
               </Button>
               <Button type="button" onClick={() => setFiltersOpen(false)}>
                 Done
@@ -417,19 +499,22 @@ export function FullCustomerJourneyPanel({
           </DialogContent>
         </Dialog>
 
-        {isLoading ? (
+        {isLoading && rows.length === 0 ? (
           <p className="text-sm text-muted-foreground">Loading customer journey…</p>
         ) : rows.length === 0 ? (
           <div className="text-sm text-muted-foreground space-y-2">
             <p>{emptyMessage}</p>
             {hasActiveFilters ? (
               <Button type="button" variant="link" className="h-auto p-0" onClick={clearFilters}>
-                Clear filters
+                Reset to Today
               </Button>
             ) : null}
           </div>
         ) : (
           <div ref={scrollRootRef} className={`${maxHeightClassName} overflow-y-auto space-y-2 pr-1`}>
+            {isLoading ? (
+              <p className="text-xs text-muted-foreground">Updating journey data…</p>
+            ) : null}
             {visibleItems.map((row) => {
               const expanded = expandedId === row.id
               const resolved = resolveDealerDetails?.(row.quotation, row.dealerId)

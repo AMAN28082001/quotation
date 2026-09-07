@@ -52,16 +52,110 @@ export function setInstallationScheduledDateInLocalMap(quotationId: string, ymd:
 /** Local-only metering pipeline stages (until backend exposes metering workflow). */
 export const METERING_WORKFLOW_MAP_KEY = "meteringWorkflowMap"
 
+/** Admin sent quotation to Metering from Quotations tab — survives refresh until Retrieve. */
+export const ADMIN_METERING_HANDOFF_MAP_KEY = "adminMeteringHandoffMap"
+
 export type OperationalQuotationRecord = Record<string, any>
+
+export function readAdminMeteringHandoffMap(): Record<string, true> {
+  if (typeof window === "undefined") return {}
+  try {
+    const raw = JSON.parse(localStorage.getItem(ADMIN_METERING_HANDOFF_MAP_KEY) || "{}")
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+    const out: Record<string, true> = {}
+    for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (id && value) out[id] = true
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+export function markAdminMeteringHandoff(quotationId: string) {
+  if (typeof window === "undefined" || !quotationId) return
+  try {
+    const map = readAdminMeteringHandoffMap()
+    map[quotationId] = true
+    localStorage.setItem(ADMIN_METERING_HANDOFF_MAP_KEY, JSON.stringify(map))
+  } catch {
+    // no-op
+  }
+}
+
+export function clearAdminMeteringHandoff(quotationId: string) {
+  if (typeof window === "undefined" || !quotationId) return
+  try {
+    const map = readAdminMeteringHandoffMap()
+    delete map[quotationId]
+    localStorage.setItem(ADMIN_METERING_HANDOFF_MAP_KEY, JSON.stringify(map))
+  } catch {
+    // no-op
+  }
+}
+
+export function isAdminMeteringHandoffLocal(quotationId: string): boolean {
+  return Boolean(readAdminMeteringHandoffMap()[quotationId])
+}
+
+export function isInMeteringHandoffOrPipeline(q: OperationalQuotationRecord): boolean {
+  const id = String(q.id || "").trim()
+  if (id && isAdminMeteringHandoffLocal(id)) return true
+  return isAlreadyInMeteringPipeline(q)
+}
+
+export function mergeAdminMeteringHandoffOntoQuotation(
+  q: OperationalQuotationRecord,
+  handoffMap?: Record<string, true>,
+): OperationalQuotationRecord {
+  const map = handoffMap ?? readAdminMeteringHandoffMap()
+  const id = String(q.id || "").trim()
+  if (!id || !map[id]) return q
+  if (isAlreadyInMeteringPipeline(q)) return q
+  return {
+    ...q,
+    installationStatus: "pending_metering",
+    installation_status: "pending_metering",
+    meteringStatus: "pending_metering",
+    metering_status: "pending_metering",
+  }
+}
+
+export function syncAdminMeteringHandoffMapFromRows(rows: OperationalQuotationRecord[]) {
+  if (typeof window === "undefined") return
+  const map = readAdminMeteringHandoffMap()
+  for (const q of rows) {
+    const id = String(q.id || "").trim()
+    if (!id) continue
+    if (isAlreadyInMeteringPipeline(q)) {
+      if (canRetrieveFromMeteringPipeline(q)) map[id] = true
+      else delete map[id]
+    }
+  }
+  try {
+    localStorage.setItem(ADMIN_METERING_HANDOFF_MAP_KEY, JSON.stringify(map))
+  } catch {
+    // no-op
+  }
+}
 
 export function flattenWrappedQuotationRow(raw: unknown): OperationalQuotationRecord {
   if (!raw || typeof raw !== "object") return {}
   const r = raw as OperationalQuotationRecord
-  const nested = r.quotation
-  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
-    return { ...(nested as OperationalQuotationRecord), ...r }
+  let out: OperationalQuotationRecord = { ...r }
+  const data = r.data
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const d = data as OperationalQuotationRecord
+    if (d.id || d.documents || d.document || d.customer || d.installation || d.installerCompletion) {
+      out = { ...out, ...d }
+      delete out.data
+    }
   }
-  return { ...r }
+  const nested = out.quotation
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    out = { ...(nested as OperationalQuotationRecord), ...out }
+  }
+  return out
 }
 
 export function getInstallationWorkflowStatus(q: OperationalQuotationRecord): string {
@@ -95,6 +189,9 @@ export function isInstallationCompleteForMetering(q: OperationalQuotationRecord)
 /** Partial photo upload saved — not full Approved Installation. */
 export function isInstallationPartialApproved(q: OperationalQuotationRecord): boolean {
   const install = getInstallationWorkflowStatus(q)
+  if (install === "pending_installer" || install === "installer_in_progress" || install === "in_progress") {
+    return false
+  }
   if (install === "installer_partial_approved" || install === "partial_approved") return true
   return Boolean(q.installationPartialApproved || q.installation_partial_approved)
 }
@@ -126,6 +223,8 @@ export type SendToMeteringMenuState = {
 
 /** Ops column / badge label for quotation workflow stage. */
 export function getQuotationOpsStageLabel(q: OperationalQuotationRecord): string {
+  const id = String(q.id || "").trim()
+  if (id && isAdminMeteringHandoffLocal(id) && !isAlreadyInMeteringPipeline(q)) return "Pending metering"
   if (isAwaitingManualMeteringHandoff(q)) return "Pending metering"
   const install = getInstallationWorkflowStatus(q)
   const metering = getMeteringWorkflowRaw(q)
@@ -168,6 +267,32 @@ export function getSendToMeteringMenuState(q: OperationalQuotationRecord): SendT
 }
 
 /**
+ * Admin → Quotations tab: quotation is in metering workflow (hide Send to Metering).
+ * Covers API rows where install is still pending_installer but metering fields advanced.
+ */
+export function isQuotationsTabInMeteringWorkflow(q: OperationalQuotationRecord): boolean {
+  if (isInMeteringHandoffOrPipeline(q)) return true
+  const stage = getMeteringWorkflowStage(q)
+  if (stage) return true
+  const metering = getMeteringWorkflowRaw(q)
+  const install = getInstallationWorkflowStatus(q)
+  const workflow = new Set([
+    "metering_approved",
+    "meter_installation_pending",
+    "meter_install",
+    "meter_install_pending",
+    "mco",
+    "pending_baldev",
+    "baldev_approved",
+    "completed",
+  ])
+  if (workflow.has(metering) || workflow.has(install)) return true
+  if (q.meteringApprovedAt || q.metering_approved_at) return true
+  if (q.mcoAt || q.mco_at) return true
+  return false
+}
+
+/**
  * Admin → Quotations (All tab): manual handoff to Metering without waiting for
  * installer_approved. Pending or approved quotations not already in the metering
  * pipeline may be sent (e.g. Pending Installer after Payment Management release).
@@ -177,7 +302,7 @@ export function getAdminQuotationsTabSendToMeteringState(
 ): SendToMeteringMenuState {
   const status = String(q.status || "pending").toLowerCase()
 
-  if (isAlreadyInMeteringPipeline(q)) {
+  if (isQuotationsTabInMeteringWorkflow(q)) {
     return { visible: false, enabled: false, hint: "", sent: true }
   }
 
@@ -202,6 +327,192 @@ export function getAdminQuotationsTabSendToMeteringState(
     visible: true,
     enabled: true,
     hint: "Manually send to the Metering tab (installation may still be in progress)",
+    sent: false,
+  }
+}
+
+/** Early metering only — before Discom / WCC / MCO. */
+export function canRetrieveFromMeteringPipeline(q: OperationalQuotationRecord): boolean {
+  const id = String(q.id || "").trim()
+  const handoffLocal = id ? isAdminMeteringHandoffLocal(id) : false
+  const inPipeline = isAlreadyInMeteringPipeline(q)
+
+  if (!handoffLocal && !inPipeline) return false
+  if (isMeteringApprovedForTransition(q)) return false
+
+  const metering = getMeteringWorkflowRaw(q)
+  const install = getInstallationWorkflowStatus(q)
+  const late = new Set([
+    "metering_approved",
+    "mco",
+    "meter_installation_pending",
+    "meter_install",
+    "pending_baldev",
+    "baldev_approved",
+    "completed",
+  ])
+  if (late.has(metering) || late.has(install)) return false
+
+  if (handoffLocal && !inPipeline) {
+    const earlyInstall = new Set([
+      "pending_installer",
+      "installer_in_progress",
+      "in_progress",
+      "installer_approved",
+      "",
+    ])
+    return earlyInstall.has(install)
+  }
+
+  return true
+}
+
+export function getRetrieveFromMeteringState(q: OperationalQuotationRecord): SendToMeteringMenuState {
+  if (!canRetrieveFromMeteringPipeline(q)) {
+    return { visible: false, enabled: false, hint: "", sent: false }
+  }
+  return {
+    visible: true,
+    enabled: true,
+    hint: "Retrieve from Metering back to Installation (approved handoff)",
+    sent: false,
+  }
+}
+
+/** Admin → Quotations tab Retrieve action (optional local metering stage override). */
+export function getAdminQuotationsTabRetrieveState(
+  q: OperationalQuotationRecord,
+  meteringStageOverride?: MeteringWorkflowTab | null,
+): SendToMeteringMenuState {
+  if (meteringStageOverride === "processing") {
+    return {
+      visible: true,
+      enabled: true,
+      hint: "Retrieve from Metering back to Installation",
+      sent: false,
+    }
+  }
+  return getRetrieveFromMeteringState(q)
+}
+
+/** Remove Payment Management release flags from browser local map. */
+export function clearInstallerReleaseInLocalMap(quotationId: string) {
+  if (typeof window === "undefined" || !quotationId) return
+  try {
+    const map = readInstallerReleaseMap()
+    delete map[quotationId]
+    localStorage.setItem(INSTALLER_RELEASE_MAP_KEY, JSON.stringify(map))
+  } catch {
+    // no-op
+  }
+}
+
+/** Undo Send to Installer — blocked only at late metering / final confirmation stages. */
+export function canRetrieveFromInstallationPipeline(
+  q: OperationalQuotationRecord,
+  releaseMap?: Record<string, any>,
+): boolean {
+  const map = releaseMap ?? readInstallerReleaseMap()
+  const merged = mergeInstallerReleaseOntoQuotation(q, map)
+  if (!isQuotationSentToInstaller(merged, map) && !shouldShowInAdminInstallationTab(merged, map)) {
+    return false
+  }
+
+  const metering = getMeteringWorkflowRaw(merged)
+  const install = getInstallationWorkflowStatus(merged)
+
+  // API often copies metering / meter-install stages into installation_status while the
+  // Admin Installation tab still shows Pending — only block on true late metering.
+  const meteringLate = new Set([
+    "metering_approved",
+    "meter_installation_pending",
+    "meter_install_pending",
+    "meter_install",
+    "mco",
+  ])
+  const installTerminal = new Set(["pending_baldev", "baldev_approved", "completed"])
+
+  if (meteringLate.has(metering)) return false
+  if (installTerminal.has(install)) return false
+  if (install === "metering_approved" || install === "mco") return false
+
+  return true
+}
+
+/** Admin Installation tab: open jobs (pending / in progress / partial) may always revert to Accounts. */
+export function canRevertInstallationToAccountsOnAdminTab(
+  q: OperationalQuotationRecord,
+  installerTabStatus: "pending" | "inprogress" | "partial" | "approved",
+  releaseMap?: Record<string, any>,
+): boolean {
+  const map = releaseMap ?? readInstallerReleaseMap()
+  if (!shouldShowInstallationRevertButton(q, map)) return false
+  if (
+    installerTabStatus === "pending" ||
+    installerTabStatus === "inprogress" ||
+    installerTabStatus === "partial"
+  ) {
+    return true
+  }
+  return canRetrieveFromInstallationPipeline(q, map)
+}
+
+export function getAdminInstallationTabRevertState(
+  q: OperationalQuotationRecord,
+  installerTabStatus: "pending" | "inprogress" | "partial" | "approved",
+  releaseMap?: Record<string, any>,
+): SendToMeteringMenuState {
+  const map = releaseMap ?? readInstallerReleaseMap()
+  if (!shouldShowInstallationRevertButton(q, map)) {
+    return { visible: false, enabled: false, hint: "", sent: false }
+  }
+  const enabled = canRevertInstallationToAccountsOnAdminTab(q, installerTabStatus, map)
+  if (!enabled) {
+    return {
+      visible: true,
+      enabled: false,
+      hint: "Already in Metering (approved or later) — use Retrieve on Quotations or Metering tab",
+      sent: false,
+    }
+  }
+  return {
+    visible: true,
+    enabled: true,
+    hint: "Revert to Accounts (undo Send to Installer)",
+    sent: false,
+  }
+}
+
+/** Show Revert on Admin Installation + Accounts whenever row was released to installer. */
+export function shouldShowInstallationRevertButton(
+  q: OperationalQuotationRecord,
+  releaseMap?: Record<string, any>,
+): boolean {
+  const map = releaseMap ?? readInstallerReleaseMap()
+  const merged = mergeInstallerReleaseOntoQuotation(q, map)
+  return isQuotationSentToInstaller(merged, map) || shouldShowInAdminInstallationTab(merged, map)
+}
+
+export function getRetrieveFromInstallationState(
+  q: OperationalQuotationRecord,
+  releaseMap?: Record<string, any>,
+): SendToMeteringMenuState {
+  const map = releaseMap ?? readInstallerReleaseMap()
+  if (!shouldShowInstallationRevertButton(q, map)) {
+    return { visible: false, enabled: false, hint: "", sent: false }
+  }
+  if (!canRetrieveFromInstallationPipeline(q, map)) {
+    return {
+      visible: true,
+      enabled: false,
+      hint: "Already in Metering (approved or later) — use Retrieve on Quotations or Metering tab",
+      sent: false,
+    }
+  }
+  return {
+    visible: true,
+    enabled: true,
+    hint: "Revert to Accounts (undo Send to Installer)",
     sent: false,
   }
 }
@@ -305,6 +616,11 @@ export function isInstallationApprovedForAdminTab(
   q: OperationalQuotationRecord,
   opts?: { imageUrlCount?: number; inInstallerApprovedQueue?: boolean },
 ): boolean {
+  const install = getInstallationWorkflowStatus(q)
+  // Admin Revert → pending must win over leftover photos / approved-queue ids.
+  if (install === "pending_installer" || install === "installer_in_progress" || install === "in_progress") {
+    return false
+  }
   // Partial uploads stay in Partial Approved — never the Approved Installation tab.
   if (isInstallationPartialApproved(q)) return false
   // Real installer completion (do not treat pending_metering alone as installed —
@@ -520,35 +836,84 @@ export function extractQuotationListTotalFromApiResponse(response: unknown): num
   return null
 }
 
+function isHollowMediaValue(value: unknown): boolean {
+  if (value == null) return true
+  if (typeof value === "string") return value.trim() === ""
+  if (Array.isArray(value)) return value.length === 0
+  if (typeof value === "object") return Object.keys(value as object).length === 0
+  return false
+}
+
+/** Prefer the payload that actually has files; empty `{}` / `[]` must not hide GET-by-id photos. */
+function preferFilledMedia<T>(listValue: T, detailValue: T): T {
+  if (isHollowMediaValue(listValue) && !isHollowMediaValue(detailValue)) return detailValue
+  if (isHollowMediaValue(detailValue) && !isHollowMediaValue(listValue)) return listValue
+  if (!isHollowMediaValue(detailValue)) return detailValue
+  return listValue
+}
+
+function mergeDocumentBags(listValue: unknown, detailValue: unknown): unknown {
+  if (isHollowMediaValue(listValue)) return detailValue
+  if (isHollowMediaValue(detailValue)) return listValue
+  if (
+    listValue &&
+    detailValue &&
+    typeof listValue === "object" &&
+    typeof detailValue === "object" &&
+    !Array.isArray(listValue) &&
+    !Array.isArray(detailValue)
+  ) {
+    const listObj = listValue as Record<string, unknown>
+    const detailObj = detailValue as Record<string, unknown>
+    const out: Record<string, unknown> = { ...listObj, ...detailObj }
+    for (const key of new Set([...Object.keys(listObj), ...Object.keys(detailObj)])) {
+      out[key] = preferFilledMedia(listObj[key], detailObj[key])
+    }
+    return out
+  }
+  return preferFilledMedia(listValue, detailValue)
+}
+
 /** Merge installer-queue / detail payloads into admin list rows without clobbering mapped customer/status. */
 export function mergeInstallationMediaSources(
   base: OperationalQuotationRecord,
   extra?: OperationalQuotationRecord | null,
 ): OperationalQuotationRecord {
   if (!extra) return base
-  const documents =
-    base.documents || base.document || extra.documents || extra.document
+  const documents = mergeDocumentBags(base.documents || base.document, extra.documents || extra.document)
+  const customer =
+    base.customer && typeof base.customer === "object" && String((base.customer as { firstName?: string }).firstName || "").trim()
+      ? base.customer
+      : extra.customer || base.customer
   return {
-    ...extra,
     ...base,
+    ...extra,
+    id: String(base.id || extra.id || ""),
+    customer,
     ...(documents ? { documents, document: documents } : {}),
-    installation: base.installation || extra.installation,
-    installerInstallation: base.installerInstallation || extra.installerInstallation,
-    installationCompletion: base.installationCompletion || extra.installationCompletion,
-    installerCompletion: base.installerCompletion || extra.installerCompletion,
-    siteCompletionImages: base.siteCompletionImages || extra.siteCompletionImages,
-    site_completion_images: base.site_completion_images || extra.site_completion_images,
-    installerCompletionImages: base.installerCompletionImages || extra.installerCompletionImages,
-    installer_completion_images: base.installer_completion_images || extra.installer_completion_images,
-    installationImageUrls: base.installationImageUrls || extra.installationImageUrls,
-    installation_image_urls: base.installation_image_urls || extra.installation_image_urls,
-    existingInstallationImageUrlsJson:
-      base.existingInstallationImageUrlsJson || extra.existingInstallationImageUrlsJson,
-    existing_installation_image_urls_json:
-      base.existing_installation_image_urls_json || extra.existing_installation_image_urls_json,
-    installerRemarks: base.installerRemarks ?? extra.installerRemarks,
-    installer_remarks: base.installer_remarks ?? extra.installer_remarks,
-    piUploadUrl: base.piUploadUrl || extra.piUploadUrl,
-    pi_upload_url: base.pi_upload_url || extra.pi_upload_url,
+    installation: preferFilledMedia(base.installation, extra.installation),
+    installerInstallation: preferFilledMedia(base.installerInstallation, extra.installerInstallation),
+    installationCompletion: preferFilledMedia(base.installationCompletion, extra.installationCompletion),
+    installerCompletion: preferFilledMedia(base.installerCompletion, extra.installerCompletion),
+    siteCompletionImages: preferFilledMedia(base.siteCompletionImages, extra.siteCompletionImages),
+    site_completion_images: preferFilledMedia(base.site_completion_images, extra.site_completion_images),
+    installerCompletionImages: preferFilledMedia(base.installerCompletionImages, extra.installerCompletionImages),
+    installer_completion_images: preferFilledMedia(base.installer_completion_images, extra.installer_completion_images),
+    installationImages: preferFilledMedia(base.installationImages, extra.installationImages),
+    installation_images: preferFilledMedia(base.installation_images, extra.installation_images),
+    installationImageUrls: preferFilledMedia(base.installationImageUrls, extra.installationImageUrls),
+    installation_image_urls: preferFilledMedia(base.installation_image_urls, extra.installation_image_urls),
+    existingInstallationImageUrlsJson: preferFilledMedia(
+      base.existingInstallationImageUrlsJson,
+      extra.existingInstallationImageUrlsJson,
+    ),
+    existing_installation_image_urls_json: preferFilledMedia(
+      base.existing_installation_image_urls_json,
+      extra.existing_installation_image_urls_json,
+    ),
+    installerRemarks: extra.installerRemarks ?? base.installerRemarks,
+    installer_remarks: extra.installer_remarks ?? base.installer_remarks,
+    piUploadUrl: preferFilledMedia(base.piUploadUrl, extra.piUploadUrl),
+    pi_upload_url: preferFilledMedia(base.pi_upload_url, extra.pi_upload_url),
   }
 }

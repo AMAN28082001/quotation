@@ -6,7 +6,12 @@
 import type { JourneyCallingAction } from "@/lib/full-customer-journey"
 import { normalizeMobileForMatch } from "@/lib/quotation-api-payload"
 import { parseTaggedCallRemark } from "@/lib/calling-remark-payload"
-import { resolveCallingActionRemark } from "@/lib/dealer-calling-action-history"
+import {
+  readAllDealerCallingActions,
+  resolveCallingActionRemark,
+} from "@/lib/dealer-calling-action-history"
+import { api, ApiError } from "@/lib/api"
+import { callingActionRowKey, extractCallingActionsFromApiResponse } from "@/lib/calling-report-date-range"
 
 const ACTION_ARRAY_KEYS = [
   "actions",
@@ -125,8 +130,16 @@ export function normalizeJourneyCallingAction(item: any, index: number): Journey
     item?.created_at ||
     item?.calledAt ||
     item?.called_at ||
+    item?.submittedAt ||
+    item?.submitted_at ||
+    item?.completedAt ||
+    item?.completed_at ||
+    item?.dialledAt ||
+    item?.dialled_at ||
     lead?.actionAt ||
     lead?.action_at ||
+    lead?.updatedAt ||
+    lead?.createdAt ||
     ""
   const leadId = String(
     item?.leadId ||
@@ -197,6 +210,154 @@ export function normalizeJourneyCallingActions(response: unknown): JourneyCallin
   return extractCallingActionList(response).map((item, index) =>
     normalizeJourneyCallingAction(item, index),
   )
+}
+
+function mergeCallingActionRowsInto(target: unknown[], seenKeys: Set<string>, rows: unknown[]) {
+  for (const row of rows) {
+    const rec = row as Record<string, unknown>
+    const key = callingActionRowKey({
+      id: String(rec.id || rec._id || ""),
+      leadId: String(rec.leadId || rec.lead_id || (rec.lead as { id?: string } | undefined)?.id || ""),
+      customerMobile: String(rec.mobile || rec.customerMobile || rec.customer_mobile || ""),
+      action: String(rec.action || rec.status || ""),
+      actionAt: String(rec.actionAt || rec.action_at || rec.updatedAt || rec.createdAt || ""),
+    })
+    if (seenKeys.has(key)) continue
+    seenKeys.add(key)
+    target.push(row)
+  }
+}
+
+/**
+ * Load calling actions for Admin Customer Journey.
+ * Tries admin API → HR API → per-dealer browser cache when admin RBAC blocks calling-actions.
+ *
+ * Pass a date `range` (default `daily` / today) so the tab does not wait on all-time pagination.
+ */
+export type JourneyCallingLoadOptions = {
+  range?: "daily" | "weekly" | "monthly" | "last_month" | "all" | "custom"
+  startDate?: string
+  endDate?: string
+  fromDate?: string
+  toDate?: string
+  maxPages?: number
+  /** Called after each page so UI can paint before the full fetch finishes. */
+  onProgress?: (actions: JourneyCallingAction[], done: boolean) => void
+}
+
+export async function loadJourneyCallingActionsForAdmin(
+  dealerIds: string[],
+  options?: JourneyCallingLoadOptions,
+): Promise<JourneyCallingAction[]> {
+  const collected: unknown[] = []
+  const seenKeys = new Set<string>()
+  const limit = 250
+  const range = options?.range ?? "daily"
+  const maxPages = options?.maxPages ?? (range === "all" ? 40 : 8)
+
+  const queryBase: {
+    limit: number
+    range: "daily" | "weekly" | "monthly" | "last_month" | "all" | "custom"
+    startDate?: string
+    endDate?: string
+    fromDate?: string
+    toDate?: string
+  } = {
+    limit,
+    range,
+  }
+  if (options?.startDate) queryBase.startDate = options.startDate
+  if (options?.endDate) queryBase.endDate = options.endDate
+  if (options?.fromDate) queryBase.fromDate = options.fromDate
+  if (options?.toDate) queryBase.toDate = options.toDate
+
+  const emitProgress = (done: boolean) => {
+    if (!options?.onProgress) return
+    options.onProgress(normalizeJourneyCallingActions({ actions: collected }), done)
+  }
+
+  const paginate = async (fetchPage: (page: number) => Promise<unknown | null>) => {
+    for (let page = 1; page <= maxPages; page += 1) {
+      const response = await fetchPage(page)
+      if (!response) break
+      const { rows, total } = extractCallingActionsFromApiResponse(response)
+      if (rows.length === 0) break
+      const before = collected.length
+      mergeCallingActionRowsInto(collected, seenKeys, rows)
+      if (collected.length === before) break
+      emitProgress(false)
+      if (rows.length < limit) break
+      if (total != null && collected.length >= total) break
+    }
+  }
+
+  try {
+    await paginate(async (page) => {
+      try {
+        return await api.admin.callingActions.getAll({ ...queryBase, page })
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          (error.code === "AUTH_004" || error.code === "HTTP_403")
+        ) {
+          return null
+        }
+        throw error
+      }
+    })
+  } catch {
+    // fall through to HR / local
+  }
+
+  if (collected.length === 0) {
+    try {
+      const hr = await api.hr.callingActions.getAll({
+        limit: range === "all" ? 2000 : 500,
+        range,
+        ...(options?.startDate ? { startDate: options.startDate } : {}),
+        ...(options?.endDate ? { endDate: options.endDate } : {}),
+      })
+      mergeCallingActionRowsInto(collected, seenKeys, extractCallingActionsFromApiResponse(hr).rows)
+    } catch {
+      // ignore
+    }
+  }
+
+  if (collected.length === 0 && dealerIds.length > 0) {
+    mergeCallingActionRowsInto(collected, seenKeys, readAllDealerCallingActions(dealerIds))
+  }
+
+  const normalized = normalizeJourneyCallingActions({ actions: collected })
+  emitProgress(true)
+  return normalized
+}
+
+/** Search enrichment for Customer Journey when bulk admin list is unavailable. */
+export async function searchJourneyCallingActionsForAdmin(
+  search: string,
+): Promise<JourneyCallingAction[]> {
+  const trimmed = search.trim()
+  if (trimmed.length < 3) return []
+  const digits = trimmed.replace(/\D/g, "")
+  const query = {
+    limit: 200,
+    search: digits.length >= 8 ? digits.slice(-10) : trimmed,
+    range: "all" as const,
+  }
+
+  for (const fetcher of [
+    () => api.admin.callingActions.getAll(query),
+    () => api.hr.callingActions.getAll(query),
+  ]) {
+    try {
+      const response = await fetcher()
+      const found = normalizeJourneyCallingActions(response)
+      if (found.length > 0) return found
+    } catch {
+      // try next source
+    }
+  }
+  return []
 }
 
 /** Read optional calling lead id stored on a quotation row from backend. */

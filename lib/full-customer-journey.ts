@@ -26,6 +26,7 @@ import {
   type JourneyStageStatus,
 } from "@/lib/customer-journey"
 import { formatPersonName } from "@/lib/name-display"
+import { getQuotationApprovalDate } from "@/lib/quotation-approval-date"
 
 export type FullJourneyStageKey =
   | "callingData"
@@ -93,10 +94,40 @@ function mobileKey(value: string | undefined | null): string {
   return journeyMobileKey(value)
 }
 
+function parseToValidDate(value: string | undefined | null): Date | null {
+  const raw = String(value || "").trim()
+  if (!raw) return null
+
+  // Calling Data often stores "10/6/2026, 5:42:50 pm" as dd/mm/yyyy. Prefer that
+  // before native Date (which treats slash dates as mm/dd).
+  const match = raw.match(
+    /^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?)?/i,
+  )
+  if (match) {
+    let year = Number(match[3])
+    if (year < 100) year += 2000
+    const day = Number(match[1])
+    const month = Number(match[2])
+    let hour = Number(match[4] || 0)
+    const minute = Number(match[5] || 0)
+    const second = Number(match[6] || 0)
+    const ampm = String(match[7] || "").toLowerCase()
+    if (ampm === "pm" && hour < 12) hour += 12
+    if (ampm === "am" && hour === 12) hour = 0
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const parsed = new Date(year, month - 1, day, hour, minute, second)
+      if (!Number.isNaN(parsed.getTime()) && parsed.getTime() > 0) return parsed
+    }
+  }
+
+  const native = new Date(raw)
+  if (!Number.isNaN(native.getTime()) && native.getTime() > 0) return native
+  return null
+}
+
 function safeIso(value: string | undefined | null): string {
-  if (!value) return ""
-  const d = new Date(value)
-  return Number.isNaN(d.getTime()) ? String(value) : d.toISOString()
+  const d = parseToValidDate(value)
+  return d ? d.toISOString() : ""
 }
 
 function formatActionLabel(action: JourneyCallingAction): string {
@@ -110,6 +141,10 @@ function formatActionLabel(action: JourneyCallingAction): string {
     status || bucket,
   ].filter(Boolean)
   return parts.join(" · ")
+}
+
+function actionTimeMs(value?: string | null): number {
+  return parseToValidDate(value)?.getTime() || 0
 }
 
 function firstTruthyIso(...values: Array<string | undefined | null>): string | undefined {
@@ -137,8 +172,17 @@ function readQuotationField(quotation: Quotation | undefined, ...keys: string[])
   for (const key of keys) {
     const value = q[key]
     if (typeof value === "string" && value.trim()) return value
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const asDate = new Date(value)
+      if (!Number.isNaN(asDate.getTime())) return asDate.toISOString()
+    }
   }
   return undefined
+}
+
+function isoFromDate(value: Date | null | undefined): string | undefined {
+  if (!value || Number.isNaN(value.getTime())) return undefined
+  return value.toISOString()
 }
 
 /** Resolve best-known date/time for each journey stage. */
@@ -146,27 +190,70 @@ export function resolveFullJourneyStageDates(
   actions: JourneyCallingAction[],
   quotation?: Quotation,
 ): Partial<Record<FullJourneyStageKey, string>> {
-  const sortedActions = [...actions].sort(
-    (a, b) => new Date(a.actionAt || 0).getTime() - new Date(b.actionAt || 0).getTime(),
+  const sortedActions = [...actions].sort((a, b) => actionTimeMs(a.actionAt) - actionTimeMs(b.actionAt))
+  const connectedActions = sortedActions.filter((item) => {
+    const action = String(item.action || "")
+      .toLowerCase()
+      .trim()
+    if (action === "start") return false
+    return classifyCallingConnection(item) === "connected"
+  })
+  const interestedConnected = connectedActions.filter(
+    (item) => classifyCallingActionSummaryBucket(item) === "interested",
   )
-  const firstAction = sortedActions[0]
-  const latestAction = sortedActions[sortedActions.length - 1]
+  const firstConnected = connectedActions[0]
+  const latestConnected = connectedActions[connectedActions.length - 1]
 
-  const callingData = firstTruthyIso(firstAction?.actionAt)
-  const callingAction = firstTruthyIso(latestAction?.actionAt, firstAction?.actionAt)
-
-  const quotationDate = firstTruthyIso(quotation?.createdAt)
+  const quotationDate = firstTruthyIso(
+    quotation?.createdAt,
+    readQuotationField(quotation, "created_at", "quotationDate", "quotation_date", "submittedAt", "submitted_at"),
+  )
+  const calling = callingStagesFromActions(actions)
+  // Dates only from real connected calls — never quotation dates for calling chips.
+  const callingData =
+    calling.callingData !== "pending" && firstConnected
+      ? firstTruthyIso(
+          interestedConnected[0]?.actionAt,
+          firstConnected.actionAt,
+          firstConnected.nextFollowUpAt,
+        )
+      : undefined
+  const callingAction =
+    calling.callingAction !== "pending" && latestConnected
+      ? firstTruthyIso(
+          interestedConnected[interestedConnected.length - 1]?.actionAt,
+          latestConnected.actionAt,
+          firstConnected?.actionAt,
+        )
+      : undefined
+  const callingShared = callingData || callingAction
 
   const adminApproval = firstTruthyIso(
+    isoFromDate(quotation ? getQuotationApprovalDate(quotation) : null),
     quotation?.statusApprovedAt,
-    readQuotationField(quotation, "status_approved_at", "approvedAt", "approved_at"),
+    readQuotationField(
+      quotation,
+      "status_approved_at",
+      "approvedAt",
+      "approved_at",
+      "adminApprovedAt",
+      "admin_approved_at",
+    ),
     statusHistoryAt(quotation, (s) => s === "approved"),
     quotation?.fileLoginAt,
     readQuotationField(quotation, "file_login_at"),
   )
 
   const installation = firstTruthyIso(
-    readQuotationField(quotation, "installerApprovedAt", "installer_approved_at"),
+    readQuotationField(
+      quotation,
+      "installerApprovedAt",
+      "installer_approved_at",
+      "installationApprovedAt",
+      "installation_approved_at",
+      "installationCompletedAt",
+      "installation_completed_at",
+    ),
     quotation?.installationReleasedAt,
     readQuotationField(quotation, "installation_released_at"),
     statusHistoryAt(
@@ -180,9 +267,14 @@ export function resolveFullJourneyStageDates(
 
   const metering = firstTruthyIso(
     quotation?.meteringApprovedAt,
-    readQuotationField(quotation, "metering_approved_at"),
+    readQuotationField(
+      quotation,
+      "metering_approved_at",
+      "meteringCompletedAt",
+      "metering_completed_at",
+    ),
     quotation?.mcoAt,
-    readQuotationField(quotation, "mco_at"),
+    readQuotationField(quotation, "mco_at", "mcoAt"),
     statusHistoryAt(
       quotation,
       (s) =>
@@ -194,7 +286,15 @@ export function resolveFullJourneyStageDates(
   )
 
   const finalConfirmation = firstTruthyIso(
-    readQuotationField(quotation, "baldevApprovedAt", "baldev_approved_at", "finalConfirmationAt", "final_confirmation_at"),
+    readQuotationField(
+      quotation,
+      "baldevApprovedAt",
+      "baldev_approved_at",
+      "finalConfirmationAt",
+      "final_confirmation_at",
+      "completedAt",
+      "completed_at",
+    ),
     statusHistoryAt(
       quotation,
       (s) => s === "baldev_approved" || s === "completed" || s.includes("baldev_approved"),
@@ -202,8 +302,12 @@ export function resolveFullJourneyStageDates(
   )
 
   return {
-    ...(callingData ? { callingData } : {}),
-    ...(callingAction ? { callingAction } : {}),
+    ...(calling.callingData !== "pending" && callingShared
+      ? { callingData: callingData || callingShared }
+      : {}),
+    ...(calling.callingAction !== "pending" && callingShared
+      ? { callingAction: callingAction || callingShared }
+      : {}),
     ...(quotationDate ? { quotation: quotationDate } : {}),
     ...(adminApproval ? { adminApproval } : {}),
     ...(installation ? { installation } : {}),
@@ -212,17 +316,43 @@ export function resolveFullJourneyStageDates(
   }
 }
 
-/** Display date+time for journey stage chips (local). */
+/** Display date+time for journey stage chips (local), e.g. "24 Aug 2026, 06:06 pm". */
 export function formatJourneyStageDateTime(value?: string | null): string {
-  if (!value) return "—"
-  const d = new Date(value)
-  if (Number.isNaN(d.getTime())) return "—"
-  return d.toLocaleString("en-IN", {
+  const d = parseToValidDate(value)
+  if (!d) return "—"
+  const datePart = d.toLocaleDateString("en-GB", {
     day: "2-digit",
     month: "short",
     year: "numeric",
+  })
+  const timePart = d.toLocaleTimeString("en-IN", {
     hour: "2-digit",
     minute: "2-digit",
+    hour12: true,
+  })
+  return `${datePart}, ${timePart}`
+}
+
+/** True when any action is a real call that connected and marked interested. */
+function hasCalledConnectedInterested(actions: JourneyCallingAction[]): boolean {
+  return actions.some((item) => {
+    const action = String(item.action || "")
+      .toLowerCase()
+      .trim()
+    if (action === "start") return false
+    if (classifyCallingConnection(item) !== "connected") return false
+    return classifyCallingActionSummaryBucket(item) === "interested"
+  })
+}
+
+/** True when dealer actually connected with the customer (not unanswered / start-only). */
+function hasConnectedCallingAction(actions: JourneyCallingAction[]): boolean {
+  return actions.some((item) => {
+    const action = String(item.action || "")
+      .toLowerCase()
+      .trim()
+    if (action === "start") return false
+    return classifyCallingConnection(item) === "connected"
   })
 }
 
@@ -233,18 +363,42 @@ function callingStagesFromActions(actions: JourneyCallingAction[]): {
   if (actions.length === 0) {
     return { callingData: "pending", callingAction: "pending" }
   }
-  const latest = [...actions].sort(
-    (a, b) => new Date(b.actionAt || 0).getTime() - new Date(a.actionAt || 0).getTime(),
-  )[0]
-  const action = String(latest?.action || "").toLowerCase()
-  const bucket = classifyCallingActionSummaryBucket(latest)
-  if (action === "start") {
-    return { callingData: "completed", callingAction: "in_progress" }
+
+  // Green Interested only when called + connected + interested.
+  if (hasCalledConnectedInterested(actions)) {
+    return { callingData: "completed", callingAction: "completed" }
   }
+
+  // Any call history but never connected → stay Pending (walk-in / quotation-only path).
+  if (!hasConnectedCallingAction(actions)) {
+    return { callingData: "pending", callingAction: "pending" }
+  }
+
+  const latest = [...actions]
+    .filter((item) => {
+      const action = String(item.action || "")
+        .toLowerCase()
+        .trim()
+      if (action === "start") return false
+      return classifyCallingConnection(item) === "connected"
+    })
+    .sort((a, b) => new Date(b.actionAt || 0).getTime() - new Date(a.actionAt || 0).getTime())[0]
+
+  if (!latest) {
+    return { callingData: "pending", callingAction: "pending" }
+  }
+
+  const action = String(latest.action || "")
+    .toLowerCase()
+    .trim()
+  const bucket = classifyCallingActionSummaryBucket(latest)
+
   if (bucket === "followUp" || action === "follow_up" || action === "rescheduled") {
     return { callingData: "completed", callingAction: "in_progress" }
   }
-  return { callingData: "completed", callingAction: "completed" }
+
+  // Connected call recorded but not marked interested yet.
+  return { callingData: "completed", callingAction: "in_progress" }
 }
 
 function buildTimeline(
@@ -340,12 +494,14 @@ function stagesForRow(
 
   const ops = getJourneyStageProgress(quotation)
   const status = String(quotation.status || "pending").toLowerCase()
+  // Quotation file exists → Quotation stage is Completed (with created date).
+  // Awaiting admin stays Pending on Admin Approval — not "In Progress" on Quotation.
   const quotationStage: JourneyStageStatus =
-    status === "rejected" ? "pending" : status === "pending" ? "in_progress" : "completed"
+    status === "rejected" ? "pending" : "completed"
 
   return {
-    callingData: actions.length > 0 ? "completed" : "pending",
-    callingAction: actions.length > 0 ? calling.callingAction : "pending",
+    callingData: calling.callingData,
+    callingAction: calling.callingAction,
     quotation: quotationStage,
     adminApproval: ops.adminApproval,
     installation: ops.installation,
@@ -361,11 +517,12 @@ function holdForRow(
 ): { holder: string; stageLabel: string } {
   if (quotation) {
     const hold = getJourneyHoldInfo(quotation)
-    if (String(quotation.status || "").toLowerCase() === "approved" || hold.holder !== "Admin Approval") {
+    const approvalStatus = String(quotation.status || "pending").toLowerCase()
+    if (approvalStatus !== "approved") {
       return hold
     }
-    if (stages.quotation === "in_progress") {
-      return { holder: "Quotation", stageLabel: "Pending Admin Approval" }
+    if (hold.holder !== "Admin Approval") {
+      return hold
     }
   }
 
@@ -438,12 +595,17 @@ export function buildFullCustomerJourneyRows(input: {
     }
 
     for (const action of [...byMobile, ...byLead]) consider(action)
-    // Always scan full list — keyed maps miss rows with alternate mobile formatting / missing keys.
-    for (const action of input.callingActions) consider(action)
+    if (merged.size === 0) {
+      for (const action of input.callingActions) consider(action)
+    } else {
+      // Same customer: also attach actions whose last-10 mobile matches even if map key differed.
+      for (const action of input.callingActions) {
+        if (merged.has(action.id)) continue
+        if (journeyMobilesMatch(action.customerMobile, quotation.customer?.mobile)) consider(action)
+      }
+    }
 
-    return [...merged.values()].sort(
-      (a, b) => new Date(a.actionAt || 0).getTime() - new Date(b.actionAt || 0).getTime(),
-    )
+    return [...merged.values()].sort((a, b) => actionTimeMs(a.actionAt) - actionTimeMs(b.actionAt))
   }
 
   for (const key of allKeys) {
@@ -543,7 +705,76 @@ export function buildFullCustomerJourneyRows(input: {
     })
   }
 
-  return rows.sort((a, b) => new Date(b.latestAt || 0).getTime() - new Date(a.latestAt || 0).getTime())
+  return mergeSameCustomerJourneyRows(rows).sort(
+    (a, b) => new Date(b.latestAt || 0).getTime() - new Date(a.latestAt || 0).getTime(),
+  )
+}
+
+/** One row per customer (last-10 mobile / lead). Calling-only + quotation-only of the same person become a single journey. */
+function mergeSameCustomerJourneyRows(rows: FullCustomerJourneyRow[]): FullCustomerJourneyRow[] {
+  const byKey = new Map<string, FullCustomerJourneyRow>()
+  const unmatched: FullCustomerJourneyRow[] = []
+
+  const rowKey = (row: FullCustomerJourneyRow) => {
+    const mobile = journeyMobileKey(row.customerMobile) || row.mobileKey
+    if (mobile && mobile.length >= 8) return `m:${mobile.length >= 10 ? mobile.slice(-10) : mobile}`
+    if (row.leadId) return `l:${row.leadId}`
+    return ""
+  }
+
+  for (const row of rows) {
+    const key = rowKey(row)
+    if (!key) {
+      unmatched.push(row)
+      continue
+    }
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, row)
+      continue
+    }
+    const quotation = existing.quotation || row.quotation
+    const actionMap = new Map<string, JourneyCallingAction>()
+    for (const action of [...existing.callingActions, ...row.callingActions]) {
+      actionMap.set(action.id, action)
+    }
+    const actions = [...actionMap.values()].sort((a, b) => actionTimeMs(a.actionAt) - actionTimeMs(b.actionAt))
+    const latestAction = actions[actions.length - 1]
+    const stages = stagesForRow(actions, quotation)
+    const stageDates = resolveFullJourneyStageDates(actions, quotation)
+    const hold = holdForRow(stages, quotation, latestAction)
+    const timeline = buildTimeline(actions, quotation)
+    byKey.set(key, {
+      ...existing,
+      ...row,
+      id: quotation?.id || existing.id || row.id,
+      customerName:
+        formatPersonName(quotation?.customer?.firstName, quotation?.customer?.lastName, "") ||
+        existing.customerName ||
+        row.customerName,
+      customerMobile: quotation?.customer?.mobile || existing.customerMobile || row.customerMobile,
+      mobileKey: journeyMobileKey(quotation?.customer?.mobile || existing.customerMobile || row.customerMobile) || key,
+      dealerName: latestAction?.dealerName || existing.dealerName || row.dealerName,
+      dealerId: latestAction?.dealerId || quotation?.dealerId || existing.dealerId || row.dealerId,
+      quotationId: quotation?.id || existing.quotationId || row.quotationId,
+      leadId: latestAction?.leadId || actions[0]?.leadId || existing.leadId || row.leadId,
+      fileLoginLabel: quotation ? getJourneyFileLoginLabel(quotation) : existing.fileLoginLabel || row.fileLoginLabel,
+      holdLabel: hold.stageLabel,
+      holdHolder: hold.holder,
+      stages,
+      stageDates,
+      timeline,
+      latestAt:
+        timeline[timeline.length - 1]?.at ||
+        safeIso(latestAction?.actionAt) ||
+        safeIso(quotation?.createdAt) ||
+        existing.latestAt,
+      callingActions: actions,
+      quotation,
+    })
+  }
+
+  return [...byKey.values(), ...unmatched]
 }
 
 export function matchesFullJourneySearch(row: FullCustomerJourneyRow, searchTerm: string): boolean {
@@ -606,6 +837,12 @@ export function formatFullJourneyStageLabel(
   status: JourneyStageStatus,
   stage: FullJourneyStageKey,
 ): string {
+  // Calling Action green chip = called + connected + interested.
+  if (stage === "callingAction" && status === "completed") return "Interested"
+  if (stage === "callingData" && status === "completed") return "Completed"
+  if (stage === "quotation" && status === "completed") return "Completed"
+  // Customer Journey: waiting steps show "Pending" (not amber "In Progress").
+  if (status === "pending" || status === "in_progress") return "Pending"
   if (stage === "adminApproval" || stage === "installation" || stage === "metering" || stage === "finalConfirmation") {
     return formatJourneyStageStatusLabel(
       status,
@@ -645,29 +882,24 @@ export function getRowLatestCallingAction(row: FullCustomerJourneyRow): JourneyC
 export function mobilesNeedingCallingEnrichment(
   quotations: Quotation[],
   callingActions: JourneyCallingAction[],
-  limit = 200,
+  limit = 80,
 ): string[] {
-  const rows = buildFullCustomerJourneyRows({ quotations, callingActions })
-  const pending = rows.filter((row) => row.quotation && row.stages.callingData === "pending")
-  const progressed = pending.filter(
-    (row) =>
-      row.stages.quotation === "completed" ||
-      row.stages.adminApproval === "completed" ||
-      row.stages.installation === "completed" ||
-      row.stages.metering === "completed" ||
-      row.stages.finalConfirmation === "completed",
+  const knownMobiles = new Set(
+    callingActions.map((action) => journeyMobileKey(action.customerMobile)).filter((m) => m.length >= 8),
   )
-  const ordered = [...progressed, ...pending]
+  const knownLeadIds = new Set(callingActions.map((action) => String(action.leadId || "").trim()).filter(Boolean))
+  const missing: string[] = []
   const seen = new Set<string>()
-  const out: string[] = []
-  for (const row of ordered) {
-    const mobile = journeyMobileKey(row.customerMobile)
-    if (!mobile || mobile.length < 8 || seen.has(mobile)) continue
+  for (const quotation of quotations) {
+    const leadId = readQuotationCallingLeadId(quotation as unknown as Record<string, unknown>)
+    if (leadId && knownLeadIds.has(leadId)) continue
+    const mobile = journeyMobileKey(quotation.customer?.mobile)
+    if (!mobile || mobile.length < 8 || seen.has(mobile) || knownMobiles.has(mobile)) continue
     seen.add(mobile)
-    out.push(mobile)
-    if (out.length >= limit) break
+    missing.push(mobile)
+    if (missing.length >= limit) break
   }
-  return out
+  return missing
 }
 
 export function matchesJourneyCallingSourceFilter(

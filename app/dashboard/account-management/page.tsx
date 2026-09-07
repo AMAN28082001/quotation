@@ -20,6 +20,7 @@ import {
   Calendar as CalendarIcon,
   ChevronDown,
   Send,
+  RotateCcw,
   Users,
   Loader2,
   Filter,
@@ -30,6 +31,11 @@ import { cn } from "@/lib/utils"
 import { SolarLogo } from "@/components/solar-logo"
 import { AccessSwitchBar } from "@/components/access-switch-bar"
 import { canOpenSection, getAccessOptions, getPostLoginPath } from "@/lib/user-access"
+import {
+  filterQuotationsByWorkflowPermission,
+  isWorkflowModuleReadOnly,
+  shouldLoadAllAccountsQuotations,
+} from "@/lib/module-field-permissions"
 import { CityMultiSelectFilter } from "@/components/city-multi-select-filter"
 import { matchesCityFilter } from "@/lib/service-cities"
 import { useToast } from "@/hooks/use-toast"
@@ -45,7 +51,7 @@ import { Calendar } from "@/components/ui/calendar"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import type { Quotation } from "@/lib/quotation-context"
 import { QuotationDetailsDialog } from "@/components/quotation-details-dialog"
-import { api, ApiError } from "@/lib/api"
+import { api, ApiError, retrieveQuotationFromInstallation } from "@/lib/api"
 import { calculateSystemSize } from "@/lib/pricing-tables"
 import { formatPersonName } from "@/lib/name-display"
 import {
@@ -74,6 +80,8 @@ import {
   extractQuotationListFromApiResponse,
   flattenWrappedQuotationRow,
   isQuotationSentToInstaller,
+  getRetrieveFromInstallationState,
+  clearInstallerReleaseInLocalMap,
   mergeInstallationMediaSources,
   mergeInstallerReleaseOntoQuotation,
   readInstallerReleaseMap,
@@ -395,6 +403,26 @@ function appendInstallmentWithMode(
   return next
 }
 
+/** One installment for the full payable cap (subtotal − discount). */
+function buildFullPaymentSingleInstallment(payment: CustomerPayment, markPaid = false): PaymentPhase[] {
+  const cap = Math.round(getPaymentEffectiveCap(payment))
+  const mode = defaultInstallmentPaymentMode(payment)
+  const paid = markPaid ? cap : 0
+  const status: PaymentPhase["status"] =
+    markPaid ? "completed" : paid > 0 ? "partial" : "pending"
+  return [
+    {
+      phaseNumber: 1,
+      phaseName: "Installment 1",
+      amount: cap,
+      paidAmount: paid,
+      status,
+      paymentDate: markPaid ? new Date().toISOString() : undefined,
+      paymentMode: mode,
+    },
+  ]
+}
+
 /** Persisted settlement flag from the backend (survives refresh; keeps button hidden). */
 function getQuotationFinalSettlementApplied(q: Quotation): boolean {
   const qx = q as Quotation & Record<string, unknown>
@@ -443,6 +471,89 @@ function getEffectivePaymentStatus(
   return "pending"
 }
 
+const PAYMENT_ACTIVITY_WINDOW_DAYS = 30
+
+type PaymentSectionTab = "active" | "overdue" | "completed"
+
+function parseOptionalPaymentDate(value?: string | null): Date | null {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+function getLastPaymentReceivedDate(payment: CustomerPayment): Date | null {
+  let latest: Date | null = null
+  for (const phase of payment.phases) {
+    if ((phase.paidAmount || 0) <= 0) continue
+    const d = parseOptionalPaymentDate(phase.paymentDate)
+    if (!d) continue
+    if (!latest || d > latest) latest = d
+  }
+  return latest
+}
+
+function getUnpaidPhaseDueDates(payment: CustomerPayment): Date[] {
+  const dates: Date[] = []
+  for (const phase of payment.phases) {
+    const unpaid = Math.max(0, Math.round(phase.amount || 0) - Math.round(phase.paidAmount || 0))
+    if (unpaid <= 0) continue
+    const due = parseOptionalPaymentDate(phase.dueDate)
+    if (due) dates.push(due)
+  }
+  return dates
+}
+
+/** Pending/partial with due, last payment, or approve activity in the last 30 days. */
+function matchesActivePaymentActivityWindow(payment: CustomerPayment, now = new Date()): boolean {
+  const cutoff = new Date(now)
+  cutoff.setDate(cutoff.getDate() - PAYMENT_ACTIVITY_WINDOW_DAYS)
+  const cutoffMs = cutoff.getTime()
+
+  const lastPayment = getLastPaymentReceivedDate(payment)
+  if (lastPayment && lastPayment.getTime() >= cutoffMs) return true
+
+  for (const due of getUnpaidPhaseDueDates(payment)) {
+    if (due.getTime() >= cutoffMs) return true
+  }
+
+  const approved = parseOptionalPaymentDate(payment.statusApprovedAt)
+  if (approved && approved.getTime() >= cutoffMs && getTotalPaidPhases(payment.phases) <= 0) {
+    return true
+  }
+
+  return false
+}
+
+/** Pending/partial with remaining balance and no activity in the last 30 days. */
+function matchesOverdueOutstandingPayment(payment: CustomerPayment): boolean {
+  const status = getEffectivePaymentStatus(payment)
+  if (status !== "pending" && status !== "partial") return false
+  if (getDisplayRemaining(payment) <= 0) return false
+  return !matchesActivePaymentActivityWindow(payment)
+}
+
+function splitPaymentsBySection(payments: CustomerPayment[]): {
+  activePayments: CustomerPayment[]
+  overduePayments: CustomerPayment[]
+  completedPayments: CustomerPayment[]
+} {
+  const activePayments: CustomerPayment[] = []
+  const overduePayments: CustomerPayment[] = []
+  const completedPayments: CustomerPayment[] = []
+  for (const payment of payments) {
+    const status = getEffectivePaymentStatus(payment)
+    if (status === "completed") {
+      completedPayments.push(payment)
+      continue
+    }
+    if (status === "pending" || status === "partial") {
+      activePayments.push(payment)
+      if (matchesOverdueOutstandingPayment(payment)) overduePayments.push(payment)
+    }
+  }
+  return { activePayments, overduePayments, completedPayments }
+}
+
 function formatInstallmentShortLabel(phase: PaymentPhase): string {
   const raw = String(phase.phaseName || "").trim()
   const matchedNumber = raw.match(/(\d+)/)
@@ -463,6 +574,14 @@ const PAYMENT_TYPE_FILTER_OPTIONS: { value: PaymentTypeFilterValue; label: strin
   { value: "mix", label: "Cash + loan" },
   { value: "unknown", label: "Not Set" },
 ]
+
+/** Keep dropdowns inside Filters dialog — avoids portal z-index / transform mis-positioning. */
+const PAYMENT_FILTER_SELECT_CONTENT_PROPS = {
+  disablePortal: true,
+  position: "popper" as const,
+  sideOffset: 4,
+  className: "max-h-60",
+}
 
 function getPaymentTypeFilterTriggerLabel(selected: PaymentTypeFilterValue[]): string {
   if (selected.length === 0 || selected.length === PAYMENT_TYPE_FILTER_OPTIONS.length) {
@@ -911,7 +1030,7 @@ function PaymentDateRangeFilter({
       <Label htmlFor={id} className="text-xs text-muted-foreground">
         {label}
       </Label>
-      <Popover>
+      <Popover modal={false}>
         <PopoverTrigger asChild>
           <Button
             id={id}
@@ -923,7 +1042,7 @@ function PaymentDateRangeFilter({
             <span className="truncate">{text}</span>
           </Button>
         </PopoverTrigger>
-        <PopoverContent className="w-auto p-0" align="start">
+        <PopoverContent className="z-[200] w-auto p-0" align="start">
           <Calendar
             mode="range"
             selected={value}
@@ -938,7 +1057,7 @@ function PaymentDateRangeFilter({
 }
 
 export default function AccountManagementPage() {
-  const { isAuthenticated, role, logout, accountManager, dealer, access } = useAuth()
+  const { isAuthenticated, role, logout, accountManager, dealer, access, modulePermissions, officeLocation } = useAuth()
   const router = useRouter()
   const { toast } = useToast()
   const [quotations, setQuotations] = useState<Quotation[]>([])
@@ -956,17 +1075,19 @@ export default function AccountManagementPage() {
   /** Approve date filter as calendar range (local YYYY-MM-DD derived for row matching). */
   const [approveDateRange, setApproveDateRange] = useState<DateRange | undefined>()
   const [paymentFiltersOpen, setPaymentFiltersOpen] = useState(false)
+  const [paymentSectionTab, setPaymentSectionTab] = useState<PaymentSectionTab>("active")
   const [selectedQuotation, setSelectedQuotation] = useState<Quotation | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [isInitialLoad, setIsInitialLoad] = useState(true)
-  const [activeTab, setActiveTab] = useState("approved")
+  const [activeTab, setActiveTab] = useState("payments")
   const [installmentDialogOpen, setInstallmentDialogOpen] = useState(false)
   const [activePaymentId, setActivePaymentId] = useState<string | null>(null)
   const [isSavingInstallments, setIsSavingInstallments] = useState(false)
   const [isSavingFinalSettlement, setIsSavingFinalSettlement] = useState(false)
   const [isRevertingFinalSettlement, setIsRevertingFinalSettlement] = useState(false)
   const [releasingInstallationId, setReleasingInstallationId] = useState<string | null>(null)
+  const [retrievingInstallationId, setRetrievingInstallationId] = useState<string | null>(null)
   /** Draft Cost of site values while typing; flushed to backend on blur. */
   const [siteCostDrafts, setSiteCostDrafts] = useState<Record<string, string>>({})
   const [savingSiteCostId, setSavingSiteCostId] = useState<string | null>(null)
@@ -978,6 +1099,28 @@ export default function AccountManagementPage() {
    * Not localStorage — cleared on full page reload (backend GET must echo siteCost).
    */
   const siteCostSessionRef = useRef<Record<string, number>>({})
+  const sessionUserId = accountManager?.id ?? dealer?.id
+  const accountsReadOnly = isWorkflowModuleReadOnly(modulePermissions, "accounts", {
+    userId: sessionUserId,
+    officeLocation,
+    viewerIsDealer: role === "dealer",
+    viewerIsAdmin: role === "admin" || role === "super-admin",
+  })
+  const permissionVisibleQuotations = useMemo(
+    () =>
+      filterQuotationsByWorkflowPermission(
+        quotations as unknown as Record<string, unknown>[],
+        modulePermissions,
+        "accounts",
+        {
+          userId: sessionUserId,
+          officeLocation,
+          viewerIsDealer: role === "dealer",
+          viewerIsAdmin: role === "admin" || role === "super-admin",
+        },
+      ) as unknown as Quotation[],
+    [quotations, modulePermissions, sessionUserId, officeLocation, role],
+  )
   const [subsidyDraftDetails, setSubsidyDraftDetails] = useState("")
   const [subsidyDraftAmount, setSubsidyDraftAmount] = useState("")
   const useApi = process.env.NEXT_PUBLIC_USE_API !== "false"
@@ -1030,6 +1173,16 @@ export default function AccountManagementPage() {
 
   const loadApprovedQuotations = useCallback(async () => {
     const useApi = process.env.NEXT_PUBLIC_USE_API !== "false"
+    const permCtx = {
+      userId: accountManager?.id ?? dealer?.id,
+      officeLocation,
+      viewerIsDealer: role === "dealer",
+      viewerIsAdmin: role === "admin" || role === "super-admin",
+    }
+    const loadAllApproved =
+      role === "account-management" ||
+      shouldLoadAllAccountsQuotations(modulePermissions, permCtx)
+
     setIsLoading(true)
     try {
       if (useApi) {
@@ -1050,13 +1203,14 @@ export default function AccountManagementPage() {
           return
         }
 
-        // Account Management users should use regular quotations endpoint (not admin endpoint)
-        // Backend should filter by status=approved on server side for account-management role
-        const response = await api.quotations.getAll({
-          status: "approved",  // Request only approved quotations from backend - MANDATORY
+        const listParams = {
+          status: "approved" as const,
           page: 1,
-          limit: 1000,  // Get all approved quotations (adjust pagination if needed)
-        })
+          limit: 1000,
+        }
+        const response = loadAllApproved
+          ? await api.quotations.getApprovedForAccounts(listParams)
+          : await api.quotations.getAll(listParams)
         
         // Handle different response structures
         // apiRequest returns data.data, so response might be { quotations: [...] } or just array
@@ -1312,7 +1466,7 @@ export default function AccountManagementPage() {
     } finally {
       setIsLoading(false)
     }
-  }, [toast])
+  }, [toast, modulePermissions, officeLocation, role, accountManager?.id, dealer?.id, router])
 
   useEffect(() => {
     // Skip if still initializing
@@ -1498,7 +1652,20 @@ export default function AccountManagementPage() {
     setPaymentDealerFilter("all")
   }, [paymentDealerFilter, paymentDealerOptions])
 
-  const filteredQuotations = quotations.filter(
+  useEffect(() => {
+    if (paymentSectionTab !== "completed" && paymentStatusFilter === "completed") {
+      setPaymentStatusFilter("all")
+    }
+    if (
+      paymentSectionTab === "completed" &&
+      paymentStatusFilter !== "all" &&
+      paymentStatusFilter !== "completed"
+    ) {
+      setPaymentStatusFilter("all")
+    }
+  }, [paymentSectionTab, paymentStatusFilter])
+
+  const filteredQuotations = permissionVisibleQuotations.filter(
     (q) =>
       ((q.customer?.firstName || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
         (q.customer?.lastName || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -1512,18 +1679,18 @@ export default function AccountManagementPage() {
     [...filteredQuotations].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     ),
-    quotations,
+    permissionVisibleQuotations,
   )
 
   const accountOlderCountById = useMemo(() => {
     const map = new Map<string, number>()
-    for (const group of groupQuotationsByCustomerCurrentFirst(quotations)) {
+    for (const group of groupQuotationsByCustomerCurrentFirst(permissionVisibleQuotations)) {
       map.set(group.current.id, group.history.length)
     }
     return map
-  }, [quotations])
+  }, [permissionVisibleQuotations])
 
-  const totalApprovedValue = quotations.reduce((sum, q) => sum + Math.abs(q.finalAmount || q.totalAmount || 0), 0)
+  const totalApprovedValue = permissionVisibleQuotations.reduce((sum, q) => sum + Math.abs(q.finalAmount || q.totalAmount || 0), 0)
 
   const getPaymentTypeValue = (payment: CustomerPayment) => {
     return String(payment.paymentType || payment.paymentMode || "").toLowerCase()
@@ -1648,9 +1815,15 @@ export default function AccountManagementPage() {
     ],
   )
 
+  const visibleQuotationIds = useMemo(
+    () => new Set(permissionVisibleQuotations.map((q) => q.id).filter(Boolean)),
+    [permissionVisibleQuotations],
+  )
+
   const filteredCustomerPayments = useMemo(
     () =>
       customerPayments
+        .filter((payment) => visibleQuotationIds.has(payment.quotationId))
         .filter((payment) => paymentMatchesRowFilters(payment, fileStatusFilter))
         // Recent approve date first; missing dates at the bottom
         .sort((a, b) => {
@@ -1663,14 +1836,25 @@ export default function AccountManagementPage() {
           if (bValid) return 1
           return 0
         }),
-    [customerPayments, paymentMatchesRowFilters, fileStatusFilter],
+    [customerPayments, visibleQuotationIds, paymentMatchesRowFilters, fileStatusFilter],
   )
+
+  const paymentSectionBuckets = useMemo(
+    () => splitPaymentsBySection(filteredCustomerPayments),
+    [filteredCustomerPayments],
+  )
+
+  const displayedCustomerPayments = useMemo(() => {
+    if (paymentSectionTab === "completed") return paymentSectionBuckets.completedPayments
+    if (paymentSectionTab === "overdue") return paymentSectionBuckets.overduePayments
+    return paymentSectionBuckets.activePayments
+  }, [paymentSectionTab, paymentSectionBuckets])
 
   const paymentDashboardStats = useMemo(() => {
     let totalAmount = 0
     let pendingAmount = 0
     let totalProfit = 0
-    for (const payment of filteredCustomerPayments) {
+    for (const payment of displayedCustomerPayments) {
       // Net payable after discount/settlement (so Total drops by the settlement `d`).
       // Invariant: Total = Paid + Pending.
       totalAmount += getPaymentEffectiveCap(payment)
@@ -1694,11 +1878,11 @@ export default function AccountManagementPage() {
       totalAmount,
       pendingAmount,
       totalProfit,
-      customerCount: filteredCustomerPayments.length,
+      customerCount: displayedCustomerPayments.length,
       installationCompletedRemaining,
       installationCompletedCount,
     }
-  }, [filteredCustomerPayments, customerPayments, paymentMatchesRowFilters, siteCostDrafts])
+  }, [displayedCustomerPayments, customerPayments, paymentMatchesRowFilters, siteCostDrafts])
 
   const updatePaymentSiteCost = async (quotationId: string, raw: string) => {
     const siteCost = parseSiteCostInput(raw)
@@ -1900,7 +2084,8 @@ export default function AccountManagementPage() {
     paymentDealerFilter,
     approveDateRange?.from?.toISOString() ?? "",
     approveDateRange?.to?.toISOString() ?? "",
-    filteredCustomerPayments.length,
+    paymentSectionTab,
+    displayedCustomerPayments.length,
   ].join("|")
 
   const {
@@ -1910,7 +2095,7 @@ export default function AccountManagementPage() {
     sentinelRef: paymentListSentinelRef,
     visibleCount: visiblePaymentCount,
     totalCount: filteredPaymentTotal,
-  } = useIncrementalList(filteredCustomerPayments, {
+  } = useIncrementalList(displayedCustomerPayments, {
     batchSize: 15,
     resetKey: paymentListResetKey,
     enabled: activeTab === "payments",
@@ -1949,7 +2134,7 @@ export default function AccountManagementPage() {
   }
 
   const downloadFilteredPaymentsExcel = () => {
-    if (filteredCustomerPayments.length === 0) {
+    if (displayedCustomerPayments.length === 0) {
       toast({
         title: "No data to export",
         description: "Adjust filters to include at least one payment row.",
@@ -1996,7 +2181,7 @@ export default function AccountManagementPage() {
       "File Status",
     ]
 
-    const rows = filteredCustomerPayments.map((payment) => {
+    const rows = displayedCustomerPayments.map((payment) => {
       const paidAmount = getTotalPaidPhases(payment.phases)
       const remainingAmount = getDisplayRemaining(payment)
       const bankCell = getFinancingBankDisplay(payment)
@@ -2542,6 +2727,61 @@ export default function AccountManagementPage() {
     }
   }
 
+  const applyFullPaymentSingleInstallment = (quotationId: string) => {
+    const payment = customerPayments.find((p) => p.quotationId === quotationId)
+    if (!payment) return
+    if (getDisplayRemaining(payment) <= 0 && getEffectivePaymentStatus(payment) === "completed") {
+      toast({
+        title: "Payment already completed",
+        description: "No remaining balance to record.",
+      })
+      return
+    }
+    const cap = Math.round(getPaymentEffectiveCap(payment))
+    if (cap <= 0) {
+      toast({
+        title: "Cannot record payment",
+        description: "Subtotal is zero after discount.",
+        variant: "destructive",
+      })
+      return
+    }
+    const hasExisting = payment.phases.length > 0
+    const confirmMessage = hasExisting
+      ? `Replace ${payment.phases.length} installment(s) with one full payment of ₹${cap.toLocaleString("en-IN")}?`
+      : `Record full payment of ₹${cap.toLocaleString("en-IN")} in a single installment?`
+    if (!confirmSave(confirmMessage)) return
+
+    const phases = buildFullPaymentSingleInstallment(payment, true)
+    setCustomerPayments((prev) =>
+      prev.map((p) => (p.quotationId === quotationId ? { ...p, phases } : p)),
+    )
+    toast({
+      title: "Full payment in 1 installment",
+      description: "Marked Installment 1 as fully paid. Click Submit to save.",
+    })
+  }
+
+  const applySingleInstallmentPlan = (quotationId: string) => {
+    const payment = customerPayments.find((p) => p.quotationId === quotationId)
+    if (!payment) return
+    const cap = Math.round(getPaymentEffectiveCap(payment))
+    if (cap <= 0) return
+    if (payment.phases.length > 0) {
+      if (!confirmSave(`Replace current installments with one installment of ₹${cap.toLocaleString("en-IN")}?`)) {
+        return
+      }
+    }
+    const phases = buildFullPaymentSingleInstallment(payment, false)
+    setCustomerPayments((prev) =>
+      prev.map((p) => (p.quotationId === quotationId ? { ...p, phases } : p)),
+    )
+    toast({
+      title: "Single installment created",
+      description: "Enter paid amount or use Pay full in 1 installment.",
+    })
+  }
+
   const submitInstallments = async () => {
     if (!activePayment) return
 
@@ -2846,6 +3086,117 @@ export default function AccountManagementPage() {
     }
   }
 
+  const handleRetrieveFromInstallation = async (quotation: Quotation) => {
+    if (!quotation?.id) return
+    const releaseMap = readInstallerReleaseMap()
+    const retrieveState = getRetrieveFromInstallationState(
+      quotation as unknown as Record<string, unknown>,
+      releaseMap,
+    )
+    if (!retrieveState.enabled) {
+      toast({
+        title: "Cannot retrieve",
+        description:
+          retrieveState.hint || "This quotation is already in Metering and cannot be pulled back from Installation.",
+        variant: "destructive",
+      })
+      return
+    }
+    if (
+      !confirmSave(
+        `Retrieve ${quotation.id} from Installation back to Accounts?\n\nThis undoes Send to Installer.`,
+      )
+    ) {
+      return
+    }
+
+    setRetrievingInstallationId(quotation.id)
+    const applyRetrieveLocally = () => {
+      setQuotations((prev) =>
+        prev.map((q) =>
+          q.id === quotation.id
+            ? {
+                ...q,
+                installationReadyForInstaller: false,
+                installation_ready_for_installer: false,
+                installationReleasedAt: undefined,
+                installation_released_at: undefined,
+                installationStatus: undefined,
+                installation_status: undefined,
+              }
+            : q,
+        ),
+      )
+      setCustomerPayments((prev) =>
+        prev.map((payment) =>
+          payment.quotationId === quotation.id
+            ? {
+                ...payment,
+                quotation: {
+                  ...payment.quotation,
+                  installationReadyForInstaller: false,
+                  installation_ready_for_installer: false,
+                  installationReleasedAt: undefined,
+                  installation_released_at: undefined,
+                  installationStatus: undefined,
+                  installation_status: undefined,
+                },
+              }
+            : payment,
+        ),
+      )
+      clearInstallerReleaseInLocalMap(quotation.id)
+      try {
+        const localAll = JSON.parse(localStorage.getItem("quotations") || "[]")
+        const next = Array.isArray(localAll)
+          ? localAll.map((q: any) =>
+              q?.id === quotation.id
+                ? {
+                    ...q,
+                    installationReadyForInstaller: false,
+                    installation_ready_for_installer: false,
+                    installationReleasedAt: undefined,
+                    installation_released_at: undefined,
+                    installationStatus: undefined,
+                    installation_status: undefined,
+                  }
+                : q,
+            )
+          : localAll
+        localStorage.setItem("quotations", JSON.stringify(next))
+      } catch {
+        // no-op
+      }
+    }
+
+    try {
+      if (useApi) {
+        const ok = await retrieveQuotationFromInstallation(quotation.id)
+        if (!ok) {
+          toast({
+            title: "Retrieve failed",
+            description: "Could not clear installation release on the server.",
+            variant: "destructive",
+          })
+          return
+        }
+      }
+      applyRetrieveLocally()
+      toast({
+        title: "Reverted from Installation",
+        description: "You can Send to Installer again when ready.",
+      })
+    } catch (error) {
+      toast({
+        title: "Retrieve failed",
+        description: error instanceof ApiError ? error.message : "Could not retrieve from Installation.",
+        variant: "destructive",
+      })
+    } finally {
+      setRetrievingInstallationId(null)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-background">
       <AccessSwitchBar current="accounts" title="Accounts" />
@@ -2930,18 +3281,15 @@ export default function AccountManagementPage() {
 
         {/* Tabbed Interface */}
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-          <div className="mb-3 w-full rounded-lg border-2 border-emerald-300/80 bg-emerald-50/40 p-1.5">
-            <p className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-900/80">
-              Accounts (same as Admin)
-            </p>
-            <TabsList className="h-auto w-full justify-start bg-transparent p-0 gap-1 flex-wrap">
-              <TabsTrigger value="approved" className="gap-1.5 text-xs px-3 py-1.5 data-[state=active]:shadow-sm">
-                <FileText className="w-4 h-4" />
-                Approved Quotations
-              </TabsTrigger>
+          <div className="mb-3 w-full">
+            <TabsList className="h-auto w-full justify-start bg-muted/40 p-1 gap-1 flex-wrap rounded-lg">
               <TabsTrigger value="payments" className="gap-1.5 text-xs px-3 py-1.5 data-[state=active]:shadow-sm">
                 <Wallet className="w-4 h-4" />
                 Payment Management
+              </TabsTrigger>
+              <TabsTrigger value="approved" className="gap-1.5 text-xs px-3 py-1.5 data-[state=active]:shadow-sm">
+                <FileText className="w-4 h-4" />
+                Approved Quotations
               </TabsTrigger>
             </TabsList>
           </div>
@@ -3224,6 +3572,48 @@ export default function AccountManagementPage() {
                 </div>
               </CardHeader>
               <CardContent className="pt-0 px-2 sm:px-6 space-y-3">
+                <Tabs
+                  value={paymentSectionTab}
+                  onValueChange={(value) => setPaymentSectionTab(value as PaymentSectionTab)}
+                  className="space-y-3"
+                >
+                  <TabsList className="h-auto w-full justify-start bg-muted/40 p-1 gap-1 flex-wrap">
+                    <TabsTrigger
+                      value="active"
+                      className="gap-1.5 text-xs px-3 py-1.5 data-[state=active]:shadow-sm"
+                    >
+                      Pending & Partial
+                      <Badge variant="secondary" className="h-5 min-w-5 px-1.5 text-[10px]">
+                        {paymentSectionBuckets.activePayments.length}
+                      </Badge>
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="overdue"
+                      className="gap-1.5 text-xs px-3 py-1.5 data-[state=active]:shadow-sm"
+                    >
+                      Outstanding 30+ days
+                      <Badge variant="secondary" className="h-5 min-w-5 px-1.5 text-[10px]">
+                        {paymentSectionBuckets.overduePayments.length}
+                      </Badge>
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="completed"
+                      className="gap-1.5 text-xs px-3 py-1.5 data-[state=active]:shadow-sm"
+                    >
+                      Completed
+                      <Badge variant="secondary" className="h-5 min-w-5 px-1.5 text-[10px]">
+                        {paymentSectionBuckets.completedPayments.length}
+                      </Badge>
+                    </TabsTrigger>
+                  </TabsList>
+                  <p className="text-[11px] text-muted-foreground px-0.5">
+                    {paymentSectionTab === "completed"
+                      ? "Fully paid files — installments complete or final settlement applied."
+                      : paymentSectionTab === "overdue"
+                        ? "Pending or partial with remaining balance · no due date, payment, or approve activity in the last 30 days."
+                        : "All pending and partial payments — not limited to the last 30 days."}
+                  </p>
+                </Tabs>
                 {!isLoading && customerPayments.length > 0 && (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                     <Card className="border-border/60 bg-card shadow-sm">
@@ -3324,7 +3714,7 @@ export default function AccountManagementPage() {
                           <p className="text-xl font-bold text-foreground">
                             {paymentDashboardStats.customerCount.toLocaleString()}
                           </p>
-                          <p className="text-[11px] text-muted-foreground">Matching current filters</p>
+                          <p className="text-[11px] text-muted-foreground">Matching current section & filters</p>
                         </div>
                       </CardContent>
                     </Card>
@@ -3347,9 +3737,13 @@ export default function AccountManagementPage() {
                   </div>
                 ) : (
                   <div className="native-scroll-list max-h-[min(70vh,820px)] space-y-2.5 overflow-y-auto overscroll-y-contain pr-1">
-                    {filteredCustomerPayments.length === 0 ? (
+                    {displayedCustomerPayments.length === 0 ? (
                       <div className="text-center py-8 text-muted-foreground text-sm border border-dashed rounded-md">
-                        No rows match current filters.
+                        {paymentSectionTab === "completed"
+                          ? "No completed payments match current filters."
+                          : paymentSectionTab === "overdue"
+                            ? "No outstanding payments older than 30 days match current filters."
+                            : "No pending or partial payments match current filters."}
                       </div>
                     ) : (
                       visibleCustomerPayments.map((payment) => {
@@ -3366,6 +3760,14 @@ export default function AccountManagementPage() {
                             : effectiveStatus === "partial"
                               ? "Partial"
                               : "Pending"
+                        const sentToInstaller = isQuotationSentToInstaller(
+                          payment.quotation as unknown as Record<string, unknown>,
+                          readInstallerReleaseMap(),
+                        )
+                        const revertFromInstallation = getRetrieveFromInstallationState(
+                          payment.quotation as unknown as Record<string, unknown>,
+                          readInstallerReleaseMap(),
+                        )
 
                         return (
                           <Card
@@ -3627,16 +4029,38 @@ export default function AccountManagementPage() {
 
                               <div className="col-span-2 sm:col-span-3 xl:col-span-1 min-w-0 flex xl:justify-end">
                                 <div className="flex flex-col items-stretch gap-1 w-full max-w-[7.25rem] min-w-0">
-                                  {isQuotationSentToInstaller(
-                                    payment.quotation as unknown as Record<string, unknown>,
-                                    readInstallerReleaseMap(),
-                                  ) ? (
-                                    <Badge
-                                      variant="outline"
-                                      className="justify-center text-[9px] px-1.5 h-6 border-emerald-500 text-emerald-700 whitespace-nowrap truncate"
-                                    >
-                                      Sent to installer
-                                    </Badge>
+                                  {sentToInstaller ? (
+                                    <>
+                                      <Badge
+                                        variant="outline"
+                                        className="justify-center text-[9px] px-1.5 h-6 border-emerald-500 text-emerald-700 whitespace-nowrap truncate"
+                                      >
+                                        Sent to installer
+                                      </Badge>
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-6 px-1.5 text-[10px] leading-none w-full font-medium border-amber-800/40"
+                                        onClick={() => void handleRetrieveFromInstallation(payment.quotation)}
+                                        disabled={
+                                          accountsReadOnly ||
+                                          !revertFromInstallation.enabled ||
+                                          retrievingInstallationId === payment.quotationId
+                                        }
+                                        title={
+                                          revertFromInstallation.hint ||
+                                          "Revert to Accounts (undo Send to Installer)"
+                                        }
+                                      >
+                                        <RotateCcw className="w-3 h-3 mr-1 shrink-0" />
+                                        <span className="truncate">
+                                          {retrievingInstallationId === payment.quotationId
+                                            ? "Reverting..."
+                                            : "Revert"}
+                                        </span>
+                                      </Button>
+                                    </>
                                   ) : (
                                     <Button
                                       type="button"
@@ -3644,7 +4068,7 @@ export default function AccountManagementPage() {
                                       size="sm"
                                       className="h-6 px-1.5 text-[10px] leading-none w-full font-medium"
                                       onClick={() => void handleReleaseToInstaller(payment.quotation)}
-                                      disabled={releasingInstallationId === payment.quotationId}
+                                      disabled={accountsReadOnly || releasingInstallationId === payment.quotationId}
                                       title="Send this quotation to installer dashboard"
                                     >
                                       <Send className="w-3 h-3 mr-1 shrink-0" />
@@ -3676,7 +4100,7 @@ export default function AccountManagementPage() {
                         )
                       })
                     )}
-                    {filteredCustomerPayments.length > 0 ? (
+                    {displayedCustomerPayments.length > 0 ? (
                       <IncrementalListSentinel
                         sentinelRef={paymentListSentinelRef}
                         visibleCount={visiblePaymentCount}
@@ -3695,11 +4119,14 @@ export default function AccountManagementPage() {
 
       {/* Payment filters modal */}
       <Dialog open={paymentFiltersOpen} onOpenChange={setPaymentFiltersOpen}>
-        <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>Filters</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 pt-1">
+        <DialogContent className="max-w-lg max-h-[85vh] overflow-hidden p-0 gap-0">
+          <div className="flex flex-col max-h-[85vh]">
+            <div className="px-6 pt-6 pb-2 shrink-0">
+              <DialogHeader>
+                <DialogTitle>Filters</DialogTitle>
+              </DialogHeader>
+            </div>
+            <div className="space-y-4 px-6 pb-6 overflow-y-auto flex-1 min-h-0">
             <PaymentDateRangeFilter
               id="approve-date-range"
               label="Approve date range"
@@ -3709,7 +4136,7 @@ export default function AccountManagementPage() {
             />
             <div className="space-y-1">
               <Label className="text-xs text-muted-foreground">Payment type</Label>
-              <Popover>
+              <Popover modal={false}>
                 <PopoverTrigger asChild>
                   <Button
                     type="button"
@@ -3720,7 +4147,10 @@ export default function AccountManagementPage() {
                     <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                   </Button>
                 </PopoverTrigger>
-                <PopoverContent className="w-[var(--radix-popover-trigger-width)] min-w-48 p-2" align="start">
+                <PopoverContent
+                  className="z-[200] w-[var(--radix-popover-trigger-width)] min-w-48 p-2"
+                  align="start"
+                >
                   <div className="flex flex-col gap-1">
                     <button
                       type="button"
@@ -3769,14 +4199,16 @@ export default function AccountManagementPage() {
                 value={paymentStatusFilter}
                 onValueChange={(value) => setPaymentStatusFilter(value as typeof paymentStatusFilter)}
               >
-                <SelectTrigger className="h-9 text-sm">
+                <SelectTrigger className="h-9 w-full text-sm">
                   <SelectValue placeholder="Filter payment status" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent {...PAYMENT_FILTER_SELECT_CONTENT_PROPS}>
                   <SelectItem value="all">All Statuses</SelectItem>
                   <SelectItem value="pending">Pending</SelectItem>
                   <SelectItem value="partial">Partial</SelectItem>
-                  <SelectItem value="completed">Completed</SelectItem>
+                  {paymentSectionTab === "completed" ? (
+                    <SelectItem value="completed">Completed</SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
             </div>
@@ -3786,10 +4218,10 @@ export default function AccountManagementPage() {
                 value={paymentInstallmentFilter}
                 onValueChange={(value) => setPaymentInstallmentFilter(value as PaymentInstallmentFilter)}
               >
-                <SelectTrigger className="h-9 text-sm">
+                <SelectTrigger className="h-9 w-full text-sm">
                   <SelectValue placeholder="Installment" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent {...PAYMENT_FILTER_SELECT_CONTENT_PROPS}>
                   <SelectItem value="all">All installments</SelectItem>
                   <SelectItem value="1">1 installment</SelectItem>
                   <SelectItem value="2">2 installments</SelectItem>
@@ -3805,10 +4237,10 @@ export default function AccountManagementPage() {
                 value={fileStatusFilter}
                 onValueChange={(value) => setFileStatusFilter(value as FileStatusFilter)}
               >
-                <SelectTrigger className="h-9 text-sm">
+                <SelectTrigger className="h-9 w-full text-sm">
                   <SelectValue placeholder="File status" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent {...PAYMENT_FILTER_SELECT_CONTENT_PROPS}>
                   <SelectItem value="all">All file statuses</SelectItem>
                   <SelectItem value="installation:completed">Installation · Approved</SelectItem>
                   <SelectItem value="installation:in_progress">Installation · In Progress</SelectItem>
@@ -3824,10 +4256,10 @@ export default function AccountManagementPage() {
                   setSendToInstallationFilter(value as SendToInstallationFilter)
                 }
               >
-                <SelectTrigger className="h-9 text-sm">
+                <SelectTrigger className="h-9 w-full text-sm">
                   <SelectValue placeholder="Send to installation" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent {...PAYMENT_FILTER_SELECT_CONTENT_PROPS}>
                   <SelectItem value="all">All</SelectItem>
                   <SelectItem value="no">No</SelectItem>
                   <SelectItem value="yes">Yes</SelectItem>
@@ -3837,10 +4269,10 @@ export default function AccountManagementPage() {
             <div className="space-y-1">
               <Label className="text-xs text-muted-foreground">Dealer</Label>
               <Select value={paymentDealerFilter} onValueChange={setPaymentDealerFilter}>
-                <SelectTrigger className="h-9 text-sm">
+                <SelectTrigger className="h-9 w-full text-sm">
                   <SelectValue placeholder="Filter by dealer" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent {...PAYMENT_FILTER_SELECT_CONTENT_PROPS}>
                   <SelectItem value="all">All Dealers</SelectItem>
                   {paymentDealerOptions.map(([id, name]) => (
                     <SelectItem key={id} value={id}>
@@ -3876,6 +4308,7 @@ export default function AccountManagementPage() {
               >
                 Done
               </Button>
+            </div>
             </div>
           </div>
         </DialogContent>
@@ -4018,42 +4451,34 @@ export default function AccountManagementPage() {
                   <p className="text-sm text-muted-foreground">No installments created yet.</p>
                   {getPaymentTypeValue(activePayment) === "mix" ? (
                     <p className="text-xs text-muted-foreground text-center max-w-md px-4">
-                      Add one installment at a time. Choose <strong>Loan</strong> or{" "}
-                      <strong>Cash / UPI / Cheque</strong> as the payment mode — that decides which amount it
-                      deducts from.
+                      Add one installment at a time, or record the{" "}
+                      <strong>full payment in 1 installment</strong> when the customer pays everything upfront.
                     </p>
-                  ) : null}
-                  <Button
-                    type="button"
-                    onClick={() => {
-                      const updated = customerPayments.map((p) =>
-                        p.quotationId === activePayment.quotationId
-                          ? {
-                              ...p,
-                              phases: appendInstallmentWithMode(
-                                p.phases,
-                                getPaymentEffectiveCap(p),
-                                defaultInstallmentPaymentMode(p),
-                              ),
-                            }
-                          : p,
-                      )
-                      setCustomerPayments(updated)
-                    }}
-                  >
-                    Create Installment
-                  </Button>
-                </div>
-              ) : (
-                <>
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium">Installments</p>
-                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground text-center max-w-md px-4">
+                      Use <strong>Pay full in 1 installment</strong> when the customer pays the complete amount in the
+                      first installment.
+                    </p>
+                  )}
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <Button
+                      type="button"
+                      onClick={() => applyFullPaymentSingleInstallment(activePayment.quotationId)}
+                      disabled={isSavingInstallments || isSavingFinalSettlement}
+                    >
+                      Pay full in 1 installment
+                    </Button>
                     <Button
                       type="button"
                       variant="outline"
-                      size="sm"
+                      onClick={() => applySingleInstallmentPlan(activePayment.quotationId)}
+                      disabled={isSavingInstallments || isSavingFinalSettlement}
+                    >
+                      1 installment (enter paid later)
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
                       onClick={() => {
                         const updated = customerPayments.map((p) =>
                           p.quotationId === activePayment.quotationId
@@ -4070,8 +4495,50 @@ export default function AccountManagementPage() {
                         setCustomerPayments(updated)
                       }}
                     >
-                      Add
+                      Add installment (split)
                     </Button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium">Installments</p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {getDisplayRemaining(activePayment) > 0 ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => applyFullPaymentSingleInstallment(activePayment.quotationId)}
+                          disabled={isSavingInstallments || isSavingFinalSettlement}
+                        >
+                          Pay full in 1 installment
+                        </Button>
+                      ) : null}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          const updated = customerPayments.map((p) =>
+                            p.quotationId === activePayment.quotationId
+                              ? {
+                                  ...p,
+                                  phases: appendInstallmentWithMode(
+                                    p.phases,
+                                    getPaymentEffectiveCap(p),
+                                    defaultInstallmentPaymentMode(p),
+                                  ),
+                                }
+                              : p,
+                          )
+                          setCustomerPayments(updated)
+                        }}
+                      >
+                        Add
+                      </Button>
+                    </div>
                   </div>
                               
                   <div className="space-y-3">

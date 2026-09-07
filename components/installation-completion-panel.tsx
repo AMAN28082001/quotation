@@ -6,8 +6,9 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import { Image as ImageIcon, Plus, Trash2, Upload, X } from "lucide-react"
+import { Camera, Image as ImageIcon, MapPin, Plus, Trash2, Upload, X } from "lucide-react"
 import { confirmSave } from "@/lib/confirm-save"
+import { buildGpsMapCameraPhoto } from "@/lib/live-geotag-photo"
 
 export type InstallationImageField = {
   readonly key: string
@@ -72,6 +73,8 @@ type Props = {
   compact?: boolean
   /** Hide PI upload slot (e.g. WCC review modal). */
   hidePi?: boolean
+  /** Read-only: view installation fields without editing or saving. */
+  readOnly?: boolean
 }
 
 export function InstallationCompletionPanel({
@@ -102,8 +105,12 @@ export function InstallationCompletionPanel({
   uploadsOnly = false,
   compact = false,
   hidePi = false,
+  readOnly = false,
 }: Props) {
+  const locked = readOnly
   const [previewLoadErrorByField, setPreviewLoadErrorByField] = useState<Record<string, boolean>>({})
+  const [liveCapturingKey, setLiveCapturingKey] = useState<string | null>(null)
+  const [liveCaptureHintByField, setLiveCaptureHintByField] = useState<Record<string, string>>({})
   const sampleBackgroundImageUrl =
     "https://img.freepik.com/premium-vector/house-front-view-home-facade-building-exterior_171867-73.jpg"
   const frontWithPersonBackgroundImageUrl =
@@ -125,9 +132,9 @@ export function InstallationCompletionPanel({
     if (k.includes("plantwithcustomer")) return "Capture installed plant/array with customer."
     if (k.includes("inverterserial")) return "Capture inverter serial sticker close-up, fully readable."
     if (k.includes("panelserial")) return "Capture panel serial labels clearly and in focus."
-    if (k.includes("geotag")) return "Capture geo-tagged site photo with plant visible."
-    if (k.includes("other")) return "Upload any extra supporting site images."
-    return "Upload a clear, well-lit photo for this document."
+    if (k.includes("geotag")) return "Use Live photo or Upload — GPS map + address will be stamped on the image."
+    if (k.includes("other")) return "Upload or Live photo; both stamp GPS Map Camera–style location."
+    return "Upload (gallery) or Live photo (camera). Both add GPS map, address, lat/lng, and time."
   }
 
   const uploadedPreviewItems = useMemo(() => {
@@ -165,8 +172,57 @@ export function InstallationCompletionPanel({
     return ""
   }, [piFiles])
 
+  const applyGpsMapCameraStamp = async (
+    field: InstallationImageField,
+    files: File[],
+    source: "live" | "upload",
+  ) => {
+    if (!files.length) return
+    setPreviewLoadErrorByField((prev) => ({ ...prev, [field.key]: false }))
+    setLiveCapturingKey(field.key)
+    try {
+      const stampedFiles: File[] = []
+      let lastCoords: { latitude: number; longitude: number } | null = null
+      let lastPlace = ""
+      let anyStamped = false
+      for (const file of files) {
+        const result = await buildGpsMapCameraPhoto(file, source)
+        stampedFiles.push(result.file)
+        if (result.coords) lastCoords = result.coords
+        if (result.place?.title) lastPlace = result.place.title
+        if (result.stamped) anyStamped = true
+      }
+      await onFilesChange(field.key, stampedFiles)
+      const label = source === "live" ? "Live photo" : "Upload"
+      setLiveCaptureHintByField((prev) => ({
+        ...prev,
+        [field.key]: lastCoords
+          ? `${label} · GPS Map Camera · ${lastPlace || `${lastCoords.latitude.toFixed(5)}, ${lastCoords.longitude.toFixed(5)}`}`
+          : anyStamped
+            ? `${label} stamped — GPS unavailable (allow location and retry)`
+            : `${label} saved`,
+      }))
+    } catch {
+      setLiveCaptureHintByField((prev) => ({
+        ...prev,
+        [field.key]: "Could not stamp GPS. Allow camera/location and try again.",
+      }))
+    } finally {
+      setLiveCapturingKey(null)
+    }
+  }
+
+  const handleGalleryPick = (field: InstallationImageField, files: File[]) => {
+    void applyGpsMapCameraStamp(field, files, "upload")
+  }
+
+  const handleLivePhotoPick = (field: InstallationImageField, files: File[]) => {
+    void applyGpsMapCameraStamp(field, files, "live")
+  }
+
   const renderImageFieldCard = (field: InstallationImageField) => {
-    const inputId = `install-image-${field.key}`
+    const galleryInputId = `install-image-${field.key}`
+    const liveInputId = `install-image-live-${field.key}`
     const key = String(field.key).toLowerCase()
     const backgroundImageUrl = key.includes("homewithperson")
       ? frontWithPersonBackgroundImageUrl
@@ -183,6 +239,10 @@ export function InstallationCompletionPanel({
                 : sampleBackgroundImageUrl
     const uploadedCardPreviewUrl = uploadedFieldPreviewMap[field.key]
     const hasUploadedPreview = Boolean(uploadedCardPreviewUrl) && !previewLoadErrorByField[field.key]
+    const busy = Boolean(uploadingKey) || liveCapturingKey === field.key
+    const btnClass = `inline-flex items-center gap-1 rounded-md border border-border bg-background/95 text-[11px] font-medium text-foreground hover:bg-background ${
+      compact ? "h-7 px-2" : "h-8 px-2.5"
+    } ${busy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`
 
     return (
       <div key={field.key} className={compact ? "space-y-1" : "space-y-1.5"}>
@@ -220,6 +280,11 @@ export function InstallationCompletionPanel({
               className="absolute right-1.5 top-1.5 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-border bg-background/90 text-foreground shadow-sm hover:bg-background"
               onClick={() => {
                 setPreviewLoadErrorByField((prev) => ({ ...prev, [field.key]: false }))
+                setLiveCaptureHintByField((prev) => {
+                  const next = { ...prev }
+                  delete next[field.key]
+                  return next
+                })
                 onFilesChange(field.key, [])
               }}
             >
@@ -237,29 +302,49 @@ export function InstallationCompletionPanel({
               </p>
             </div>
           ) : null}
-          <div className={`absolute inset-x-0 flex justify-center px-2 ${compact ? "bottom-1.5" : "bottom-2"}`}>
+          <div
+            className={`absolute inset-x-0 z-10 flex flex-wrap items-center justify-center gap-1.5 px-2 ${
+              compact ? "bottom-1.5" : "bottom-2"
+            }`}
+          >
+            <Label htmlFor={galleryInputId} className={btnClass} title="Choose from gallery / files">
+              <Upload className="w-3.5 h-3.5 shrink-0" />
+              {uploadingKey === field.key || liveCapturingKey === field.key
+                ? "Stamping…"
+                : "Upload"}
+            </Label>
             <Label
-              htmlFor={inputId}
-              className={`inline-flex items-center gap-1.5 rounded-md border border-border bg-background/90 text-xs font-medium text-foreground hover:bg-background ${
-                compact ? "h-7 px-2.5" : "h-8 px-3"
-              } ${uploadingKey ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
+              htmlFor={liveInputId}
+              className={btnClass}
+              title="Open camera and stamp GPS Map Camera location"
             >
-              <Upload className="w-3.5 h-3.5" />
-              {uploadingKey === field.key ? "Uploading..." : "Upload"}
+              <Camera className="w-3.5 h-3.5 shrink-0" />
+              {liveCapturingKey === field.key ? "Stamping…" : "Live photo"}
             </Label>
           </div>
         </div>
         <Input
-          id={inputId}
+          id={galleryInputId}
           type="file"
           accept="image/*,.heic,.heif"
           multiple={field.multiple === true}
           className="hidden"
-          disabled={Boolean(uploadingKey)}
+          disabled={locked || busy}
           onChange={(e) => {
-            setPreviewLoadErrorByField((prev) => ({ ...prev, [field.key]: false }))
-            void onFilesChange(field.key, Array.from(e.target.files || []))
-            // Allow selecting the same file again after replacing/removing.
+            handleGalleryPick(field, Array.from(e.target.files || []))
+            e.currentTarget.value = ""
+          }}
+        />
+        <Input
+          id={liveInputId}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          multiple={field.multiple === true}
+          className="hidden"
+          disabled={locked || busy}
+          onChange={(e) => {
+            void handleLivePhotoPick(field, Array.from(e.target.files || []))
             e.currentTarget.value = ""
           }}
         />
@@ -268,6 +353,12 @@ export function InstallationCompletionPanel({
             {(filesByField[field.key] || []).length > 0
               ? `${(filesByField[field.key] || []).length} file(s) selected`
               : "No file selected"}
+          </p>
+        ) : null}
+        {liveCaptureHintByField[field.key] ? (
+          <p className="flex items-start gap-1 text-[11px] text-emerald-800 dark:text-emerald-200">
+            <MapPin className="mt-0.5 h-3 w-3 shrink-0" />
+            <span className="min-w-0 break-words">{liveCaptureHintByField[field.key]}</span>
           </p>
         ) : null}
         {previewLoadErrorByField[field.key] ? (
@@ -334,7 +425,7 @@ export function InstallationCompletionPanel({
           accept="application/pdf,image/*"
           multiple
           className="hidden"
-          disabled={Boolean(uploadingKey)}
+          disabled={locked || Boolean(uploadingKey)}
           onChange={(e) => {
             void onPiFilesChange(Array.from(e.target.files || []))
             e.currentTarget.value = ""
@@ -460,22 +551,22 @@ export function InstallationCompletionPanel({
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div>
                 <Label className="text-xs">Back leg</Label>
-                <Input type="number" min="0" step="0.01" value={dimensions.length} onChange={(e) => onDimensionsChange({ length: e.target.value })} />
+                <Input type="number" min="0" step="0.01" value={dimensions.length} readOnly={locked} onChange={(e) => onDimensionsChange({ length: e.target.value })} />
               </div>
               <div>
                 <Label className="text-xs">Mid leg (optional)</Label>
-                <Input type="number" min="0" step="0.01" value={dimensions.width} onChange={(e) => onDimensionsChange({ width: e.target.value })} />
+                <Input type="number" min="0" step="0.01" value={dimensions.width} readOnly={locked} onChange={(e) => onDimensionsChange({ width: e.target.value })} />
               </div>
               <div>
                 <Label className="text-xs">Front leg</Label>
-                <Input type="number" min="0" step="0.01" value={dimensions.height} onChange={(e) => onDimensionsChange({ height: e.target.value })} />
+                <Input type="number" min="0" step="0.01" value={dimensions.height} readOnly={locked} onChange={(e) => onDimensionsChange({ height: e.target.value })} />
               </div>
             </div>
           </div>
 
           <div className="space-y-1.5">
             <p className="text-xs font-medium">Notes (optional)</p>
-            <Textarea rows={2} placeholder="Installation notes, material used, issues, etc." value={notes} onChange={(e) => onNotesChange(e.target.value)} />
+            <Textarea rows={2} placeholder="Installation notes, material used, issues, etc." value={notes} readOnly={locked} onChange={(e) => onNotesChange(e.target.value)} />
           </div>
           </>
           ) : null}
@@ -524,7 +615,7 @@ export function InstallationCompletionPanel({
 
       {!hideFooter ? (
       <div className="flex flex-wrap justify-end gap-2">
-        <Button variant="outline" size="sm" onClick={onCancel} disabled={saving || Boolean(uploadingKey)}>
+        <Button variant="outline" size="sm" onClick={onCancel} disabled={locked || saving || Boolean(uploadingKey)}>
           Cancel
         </Button>
         {secondarySaveLabel && onSecondarySave ? (
@@ -535,7 +626,7 @@ export function InstallationCompletionPanel({
               if (!confirmSave(`Save as "${secondarySaveLabel}"?`)) return
               onSecondarySave()
             }}
-            disabled={saving || Boolean(uploadingKey)}
+            disabled={locked || saving || Boolean(uploadingKey)}
           >
             {saving ? "Saving..." : uploadingKey ? "Uploading..." : secondarySaveLabel}
           </Button>
@@ -546,7 +637,7 @@ export function InstallationCompletionPanel({
             if (!confirmSave(`Save as "${saveLabel}"?`)) return
             onSave()
           }}
-          disabled={saving || Boolean(uploadingKey)}
+          disabled={locked || saving || Boolean(uploadingKey)}
         >
           {saving ? "Saving..." : uploadingKey ? "Uploading..." : saveLabel}
         </Button>

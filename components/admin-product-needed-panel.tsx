@@ -10,7 +10,12 @@ import {
   type ProductNeededRow,
   type ProductNeededScope,
 } from "@/lib/admin-product-needed"
-import { downloadProductNeededExcel } from "@/lib/admin-product-needed-excel"
+import { downloadProductNeededExcel, PRODUCT_NEEDED_EXCEL_COLUMN_OPTIONS } from "@/lib/admin-product-needed-excel"
+import {
+  ExcelColumnPickerDialog,
+  readRememberedExcelColumns,
+  rememberExcelColumns,
+} from "@/components/excel-column-picker-dialog"
 import { formatYmdLocal } from "@/lib/calling-report-date-range"
 import { loadAdminProductNeededRows } from "@/lib/load-admin-product-needed"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -69,6 +74,9 @@ export function AdminProductNeededPanel({
   const [loadSource, setLoadSource] = useState<string | null>(null)
   const [showJobs, setShowJobs] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [excelColumnsOpen, setExcelColumnsOpen] = useState(false)
+  const [excelRememberedIds, setExcelRememberedIds] = useState<string[] | null>(null)
+  const excelColumnsStorageKey = "excel-columns:product-needed"
 
   useEffect(() => {
     if (dateRange !== "custom") return
@@ -146,7 +154,7 @@ export function AdminProductNeededPanel({
 
   const dashboard = useMemo(() => aggregateProductNeededDashboard(rows), [rows])
 
-  const downloadExcel = async () => {
+  const downloadExcel = async (selectedColumnIds: string[]) => {
     if (dashboard.jobCount === 0) {
       toast({
         title: "No data to export",
@@ -160,10 +168,11 @@ export function AdminProductNeededPanel({
     }
     setExporting(true)
     try {
-      await downloadProductNeededExcel(dashboard)
+      rememberExcelColumns(excelColumnsStorageKey, selectedColumnIds)
+      await downloadProductNeededExcel(dashboard, { selectedColumnIds })
       toast({
         title: "Excel downloaded",
-        description: `Created brand-wise sheets and DCR, Non-DCR, Both customer sheets for ${dashboard.jobCount} job(s).`,
+        description: `Created brand-wise sheets and DCR, Non-DCR, Both customer sheets for ${dashboard.jobCount} job(s) with ${selectedColumnIds.length} selected column(s).`,
       })
     } catch (error) {
       console.error("Error exporting Product Needed Excel:", error)
@@ -219,7 +228,23 @@ export function AdminProductNeededPanel({
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => void downloadExcel()}
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                if (dashboard.jobCount === 0) {
+                  toast({
+                    title: "No data to export",
+                    description:
+                      scope === "file_login"
+                        ? "Adjust filters to include at least one file-login job that is not approved."
+                        : "Adjust filters to include at least one installation-pending job.",
+                    variant: "destructive",
+                  })
+                  return
+                }
+                setExcelRememberedIds(readRememberedExcelColumns(excelColumnsStorageKey))
+                setExcelColumnsOpen(true)
+              }}
               disabled={exporting}
             >
               {exporting ? (
@@ -232,6 +257,17 @@ export function AdminProductNeededPanel({
           </div>
         </div>
       </CardHeader>
+      <ExcelColumnPickerDialog
+        open={excelColumnsOpen}
+        onOpenChange={setExcelColumnsOpen}
+        title="Select Excel columns"
+        description="Check only the fields you want to download. Then click Download."
+        columns={PRODUCT_NEEDED_EXCEL_COLUMN_OPTIONS}
+        initialSelectedIds={excelRememberedIds}
+        rowCount={dashboard.jobCount}
+        confirmLabel="Download Excel"
+        onConfirm={(ids) => void downloadExcel(ids)}
+      />
       <CardContent className="space-y-5">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <div className="relative sm:col-span-2 lg:col-span-1">

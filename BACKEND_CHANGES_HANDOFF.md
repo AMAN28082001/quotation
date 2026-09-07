@@ -3171,7 +3171,7 @@ Submit installments with total paid = AM subtotal → **200**. Refresh → phase
 | `lib/operational-install-queue.ts` | Payment **Send to Installer** gate + Admin Installation pending/approved rules |
 | `lib/visit-report.ts` | Admin Visitor Reports — status normalization, filters, row mapping |
 | `lib/final-confirmation-documents.ts` | Final confirmation multipart field names + FormData builder |
-| `lib/api.ts` | `uploadFinalConfirmationDocuments`, `sendQuotationToMetering` |
+| `lib/api.ts` | `uploadFinalConfirmationDocuments`, `sendQuotationToMetering`, `retrieveQuotationFromMetering`, `retrieveQuotationFromInstallation` |
 | `lib/operational-install-queue.ts` | `getAdminQuotationsTabSendToMeteringState`, installation vs metering visibility |
 | **`BACKEND_ADMIN_PRODUCT_NEEDED.ts`** | **§13** Admin Product Needed — installation-pending + brand aggregates |
 | `lib/admin-product-needed.ts` | Product Needed eligibility + brand card aggregation (frontend) |
@@ -3221,6 +3221,7 @@ Submit installments with total paid = AM subtotal → **200**. Refresh → phase
 | **`BACKEND_CHANGES_REQUIRED.md` §AE** | **§32** checklist + schema |
 | **`BACKEND_METER_DOCUMENT_PUBLIC_URL.ts`** | **§33 / §AF** meter document public view link |
 | **`BACKEND_CHANGES_REQUIRED.md` §AF** | **§33** checklist |
+| **`BACKEND_CUSTOMER_JOURNEY.ts`** (timestamps + bulk) | **§34 / §AG** Calling Data/Action date+time on bulk GET |
 
 ---
 
@@ -3294,3 +3295,524 @@ Upload + Save still shows **“No meter document on file yet.”** because the A
 1. Upload PDF in Metering Details → Save.
 2. Reopen modal → **Open public link** visible and opens the file.
 3. Hard refresh → link still works.
+
+---
+
+## 34. Customer Journey — Calling Data / Calling Action **date+time** on bulk GET (Aug 2026)
+
+### Frontend
+
+- Admin **Customer Journey** + dealer `/dashboard/customer-journey`
+- Green **Calling Data** / **Calling Action** chips must show **date and time**, not "—"
+- Spec: `BACKEND_CUSTOMER_JOURNEY.ts` (section *Timestamps + speed*)
+
+### Problem
+
+Stages can show **Completed** while time stays empty until the user searches a mobile. The SPA then fires many `GET .../calling-actions?search=<mobile>` calls (slow).
+
+Cause: bulk `GET .../calling-actions?range=all&limit=2000` omits `actionAt` and/or `mobile` / older rows.
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| `actionAt` | ISO-8601 on **every** calling-action row (`2026-05-18T10:15:00.000Z`). Echo `action_at` too. |
+| Bulk list | Dealer + admin GET with `range=all`, `limit` ≥ 2000 (paginate; return `pagination.total`) |
+| Join mobile | Each row includes `mobile` (from calling lead) + `leadId` |
+| Stage dates | Calling Data = **earliest** `actionAt`; Calling Action = **latest** `actionAt` |
+| Same customer | **One** journey row (last-10 mobile / `callingLeadId`). Do not split quotation vs calling. If only one call exists, both times MAY be the same `actionAt`. |
+| Do not | Require per-mobile `?search=` for the default journey list |
+
+### Optional (fastest)
+
+`GET /api/admin/customer-journey` and `GET /api/dealers/me/customer-journey` include `stageDates.callingData` and `stageDates.callingAction` as ISO-8601.
+
+### QA
+
+1. Open Customer Journey **without** searching a number.
+2. A converted lead shows Calling Data + Calling Action **Completed** with times (not "—").
+3. Network: one (or paginated) calling-actions list, not dozens of `?search=` calls.
+4. Search by mobile still works and does not change those times.
+
+---
+
+## 35. Admin Installation **Revert** (Approved → Pending) — Aug 2026
+
+### Frontend
+
+- Admin → Installation → **Approved Installation** → **Revert** → confirm
+- Calls `api.admin.quotations.revertInstallationToPending` (`lib/api.ts`)
+- Spec: **`BACKEND_INSTALLATION_REVERT.ts`**, REQUIRED **§AH**
+
+### Problem
+
+Row stayed on **Approved Installation** after Revert: backend blocked the reverse transition, or wrote `status=pending_installer` on the quotation (invalid enum), or list/queue still treated leftover photos / `installer_approved_at` as approved.
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| Allow reverse | `installer_approved` / `installer_partial_approved` → `pending_installer` for **admin** (`force` / `adminOverride` / `allowRevert`) |
+| Column | Persist **`installation_status = pending_installer`**. Do **not** change quotation `status`. |
+| Clear | `installer_approved_at = null`, `installation_partial_approved = false` |
+| Photos | Keep document URLs; do not delete S3 |
+| Queues | Pending installer GET **includes** id; approved installer GET **excludes** id |
+
+Preferred:
+
+```
+PATCH /api/admin/quotations/:id/installation-status
+{ "installationStatus": "pending_installer", "force": true, "adminOverride": true, "allowRevert": true }
+```
+
+Optional dedicated: `POST /api/admin/quotations/:id/revert-installation`
+
+### QA
+
+1. Approved Installation → Revert → Yes.
+2. Row is gone from Approved; appears under **Pending Installation**.
+3. `GET /quotations/:id` still has photos; `installationStatus` is `pending_installer`.
+4. Quotation `status` is still `approved`.
+
+---
+
+## 36. Admin Calling Reports — exact **Total Calls** for date filter (Aug 2026)
+
+### Frontend
+
+- Admin → **Calling Reports** → Employee Calling Actions
+- Spec: **`BACKEND_CALLING_REPORTS_COUNTS.ts`**, REQUIRED **§AI**, **§J**
+
+### Problem
+
+Monthly/Weekly Total Calls was **1000** or all-time: list GET ignored dates, capped at 1000, used lead created_at, counted **Start**, or ignored **page**.
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| Filter | `GET /api/admin/calling-actions` honour `range`, `startDate`/`endDate` (ISO), `fromDate`/`toDate` (`YYYY-MM-DD`) on **`action_at`** |
+| Page | Honour `page` + `limit` (250). Do not repeat page 1. |
+| Total | `pagination.total` = count **after** date + dealer filter |
+| Exclude | `action=start` |
+| `actionAt` | ISO-8601 UTC on every row |
+
+Optional: `GET /api/admin/calling-actions/summary` with `totalCalls`, `connected`, `notConnected`, `connectedNotInterested`, `connectedInterested`, `connectedFollowUp` using the **same** filter. `totalCalls === connected + notConnected`.
+
+### QA
+
+1. Calling Reports → **Monthly** vs **Weekly** vs **Daily** → three different totals (unless data is tiny).
+2. Total Calls is **not** stuck at 1000.
+3. SQL `COUNT(*)` on `action_at` in that window (excluding start) matches the card.
+
+---
+
+## 37. Installation **Upload** + **Live photo (geotag)** — Aug 2026
+
+### Frontend
+
+- Admin / Installer completion cards: **Upload** | **Live photo**
+- Spec: **`BACKEND_INSTALLATION_LIVE_GEOTAG.ts`**, REQUIRED **§AJ**
+- Client stamps GPS on the JPEG (`lib/live-geotag-photo.ts`); submit uses existing completion multipart (**§26**)
+
+### Backend must do
+
+| Priority | Change |
+|----------|--------|
+| **P0** | Keep accepting live JPEGs on existing `POST …/documents` (no Multer change required beyond §26) |
+| **P1** | Optional text field `installationImageCaptureMetaJson` — `{ fieldKey: [{ source, latitude, longitude, accuracyMeters, capturedAt }] }` |
+| **P1** | Persist + echo capture meta on `GET /admin/quotations` and `GET /quotations/:id` |
+
+### QA
+
+1. Live photo with location allowed → save → image shows stamped lat/lng.
+2. Gallery Upload still works without GPS.
+3. If meta JSON implemented: GET returns coordinates for that field.
+
+---
+
+## 38. User office location + workflow field permissions — Aug 2026
+
+### Frontend
+
+- Admin → Users → Dashboard access: **Field access** + **Who can access** (Everyone | Selected one | Only there)
+- Office location: Jaipur / Ajmer / Chomu (employee profile)
+- Spec: **`BACKEND_USER_FIELD_PERMISSIONS.ts`**, **`BACKEND_USER_FIELD_PERMISSIONS.md`**, **`BACKEND_WORKFLOW_DASHBOARD_PARITY.md`**, REQUIRED **§AK**
+- Client filter: `lib/module-field-permissions.ts` (`canViewWorkflowRecord`, `filterQuotationsByWorkflowPermission`)
+
+### Backend must do (P0)
+
+| Item | Change |
+|------|--------|
+| **DB** | `office_location`, `module_field_permissions` JSONB on user tables |
+| **User API** | `POST/PUT/GET /admin/account-managers`, dealers, visitors — accept + echo `officeLocation`, `moduleFieldPermissions` |
+| **Login** | `POST /auth/login` echoes both on `user` |
+| **Quotations** | List/detail echo `officeLocation`, `dealerId` for scope filtering |
+| **Accounts Everyone** | `GET /account-management/quotations?status=approved` returns all approved rows (not dealer-scoped) |
+| **Workflow Everyone** | `GET /admin/quotations` (or module routes) for installation/metering/final_confirmation + `scope: everyone` — see **`BACKEND_WORKFLOW_DASHBOARD_PARITY.md`** |
+
+### Permission model
+
+- **Modules:** `accounts`, `installation`, `metering`, `final_confirmation`
+- **Level:** `none` | `read` | `write`
+- **Scope:** `everyone` | `selected_users` | `office_only` (UI: Everyone | Selected one | Only there)
+- Legacy `everyone_except_dealer` → normalize to `everyone`
+- Separate from dashboard `access[]` checkboxes
+
+### Backend should do (P1)
+
+- Enforce write permission on installer / metering / baldev mutation endpoints (403 `FIELD_PERMISSION_DENIED`)
+
+### QA
+
+1. Save user with Ajmer + installation read + office_only → login → installer shows only Ajmer rows, read-only.
+2. Final confirmation write → baldev can DCR + approve; read → view only.
+3. GET user after save returns same `moduleFieldPermissions` JSON.
+
+---
+
+## 39. Admin **Retrieve from Metering** (Meter Pending → Installation approved) — Sep 2026
+
+### Frontend
+
+- Admin → **Quotations** → **Retrieve** (early metering only)
+- Admin → **Metering** → **Meter Pending** → **Retrieve**
+- `lib/api.ts` → `retrieveQuotationFromMetering`
+- `lib/operational-install-queue.ts` → `canRetrieveFromMeteringPipeline`, `getAdminQuotationsTabRetrieveState`
+- Reference: **`BACKEND_RETRIEVE_FROM_METERING.ts`**
+
+### Product
+
+Pull quotation back from **Meter Pending** / **metering_in_progress** to **installer_approved** so admin can fix installation or **Send to Metering** again. User stays on current tab (no redirect).
+
+Frontend also keeps `localStorage.adminMeteringHandoffMap` until GET echoes workflow — **backend must persist** so refresh + other devices match.
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| **Route** | `PATCH\|POST /api/admin/quotations/:id/retrieve-from-metering` |
+| **Alt** | `PATCH /api/admin/quotations/:id/metering-handoff` with `retrieveFromMetering: true` |
+| **From** | `pending_metering`, `metering_in_progress` |
+| **To** | `installation_status = installer_approved`; clear `metering_status` / `metering_stage` (null or empty) |
+| **Keep** | `installation_ready_for_installer`, `installation_released_at` (Payment Management release) |
+| **Keep** | `quotations.status` = `approved` (do not write workflow into `status` column) |
+| **Block** | `metering_approved`, `meter_installation_pending`, `mco`, `pending_baldev`, etc. → **409** |
+| **Auth** | `admin` |
+
+**Request body (frontend):**
+
+```json
+{
+  "installationStatus": "installer_approved",
+  "installation_status": "installer_approved",
+  "target": "installer_approved",
+  "retrieveFromMetering": true,
+  "allowRevert": true,
+  "force": true,
+  "adminOverride": true,
+  "source": "admin"
+}
+```
+
+**GET after success:**
+
+```json
+{
+  "installationStatus": "installer_approved",
+  "meteringStatus": null,
+  "installationReadyForInstaller": true,
+  "installationReleasedAt": "2026-08-27T…"
+}
+```
+
+Meter Pending queue GET must **exclude** the id. Quotations tab shows **Send to Metering** again when appropriate.
+
+### QA
+
+1. Send to Metering → `pending_metering` on GET.
+2. Quotations → Retrieve → **200**; stay on Quotations tab.
+3. GET echoes `installer_approved`; metering fields cleared.
+4. Meter Pending queue no longer lists row.
+5. Retrieve when `metering_approved` → **409**.
+
+---
+
+## 40. **Retrieve from Installation** (undo Send to Installer) — Sep 2026
+
+### Frontend
+
+- Admin → **Installation** → Pending / Partial / In progress → **Revert** (↺ to Accounts)
+- Account Management → **Sent to installer** → **Revert**
+- `lib/api.ts` → `retrieveQuotationFromInstallation`
+- `lib/operational-install-queue.ts` → `getRetrieveFromInstallationState`, `getAdminInstallationTabRevertState`
+- Reference: **`BACKEND_RETRIEVE_FROM_INSTALLATION.ts`**
+
+### Product
+
+Undo Account Management **Send to Installer**. Row disappears from Admin **Installation** tab; Accounts shows **Send to Installer** again.
+
+**Different flows:**
+
+| UI action | Effect |
+|-----------|--------|
+| Installation **Revert** (↺) on Pending/Partial/In progress | Clear release flags → back to Accounts |
+| Installation **Revert** on Approved tab | `installer_approved` → `pending_installer` (workflow only) — **`BACKEND_INSTALLATION_REVERT.ts`** |
+| Quotations **Retrieve** | Meter Pending → `installer_approved` — **§39** |
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| **Route** | `PATCH\|POST /api/admin/quotations/:id/retrieve-from-installation` |
+| **Fallback** | `PATCH /api/quotations/:id/installation-release` with `false` flags (merge only — do not wipe installments) |
+| **Clear** | `installation_ready_for_installer = false`, `installation_released_at = null` |
+| **Optional** | Clear `installation_status` when still `pending_installer` / `in_progress` / partial |
+| **Keep** | `quotations.status` = `approved`; keep photo URLs on quotation |
+| **Block** | When `metering_approved` / `mco` / `meter_installation_pending` → **409** |
+| **Auth** | `admin`, `account-management` |
+
+**Request body (frontend):**
+
+```json
+{
+  "installationReadyForInstaller": false,
+  "installation_ready_for_installer": false,
+  "installationReleasedAt": null,
+  "installation_released_at": null,
+  "retrieveFromInstallation": true,
+  "allowRevert": true,
+  "source": "retrieve-from-installation"
+}
+```
+
+**GET after success:**
+
+```json
+{
+  "installationReadyForInstaller": false,
+  "installation_ready_for_installer": false,
+  "installationReleasedAt": null,
+  "installation_released_at": null
+}
+```
+
+`GET /installer/queue` and Admin Installation list must **exclude** the quotation until released again.
+
+### QA
+
+1. Accounts → Send to Installer → appears under Installation Pending.
+2. Installation → Revert → **200**; row removed from Installation list.
+3. Accounts → **Send to Installer** button visible again.
+4. `GET /quotations/:id` → release flags false; photos still present.
+5. Row in `metering_approved` → Revert disabled / **409**.
+
+---
+
+## 41. **Google Sheets — Social Media Leads** (Meta / IG / FB) — Sep 2026
+
+### Frontend
+
+- HR → **Social Media** tab
+- `components/hr-social-media-sheets-panel.tsx`
+- `lib/google-sheets-social-leads.ts` — column mapping, status colours, normalizers
+- `lib/api.ts` → `api.hr.sheetSources.*` (`getAll`, `discover`, `update`, `sync`, `getLeads`)
+- Reference: **`BACKEND_GOOGLE_SHEETS_SOCIAL_LEADS.ts`**, **`BACKEND_GOOGLE_SHEETS_SOCIAL_LEADS.md`**
+
+### Product
+
+| Feature | Detail |
+|---------|--------|
+| Spreadsheet | `18zqPIpa3fcjRvfNqdm3FPC10bszPIPHbv5F3-TMk0A0` |
+| Tabs | **Live sheet only** — currently `Jaipur Leads`, `Ajmer Leads`, `Crompton Leads`, `Ajmer Solar Lead Form New` |
+| Discover | Upsert live tabs + **delete** DB rows for tabs removed/renamed in Google Sheets (UI must match sheet 1:1) |
+| Toggle ON | Dealer checkbox pool → round-robin (`active_cap`, limit 1/dealer) |
+| Sync | Pull new rows → `hr_leads` + `hr_lead_uploads` (`source_type=google_sheet`) |
+| Calling | Assigned leads in dealer **Calling Data** + HR **Uploaded Data** |
+| Colours | Sky=new, amber=pending, rose=not interested, green=visit/interested |
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| **Routes** | `GET /hr/sheet-sources`, `POST discover`, `PATCH :id`, `POST :id/sync`, `POST sync-all`, `GET :id/leads` |
+| **Discover prune (P0)** | After reading Google tab titles, upsert those rows, then **DELETE** `hr_sheet_sources` for that `spreadsheet_id` whose `sheet_tab_name` is **not** in the live list. Do not leave old tabs (`302012 Leads`, hiring forms, etc.) |
+| **GET list** | Return only remaining sources (same set as Discover) — SPA shows these as Social Media sub-tabs |
+| **Auth** | `hr` role |
+| **Google** | `googleapis` + service account; share sheet with SA email (Editor) |
+| **Env** | `GOOGLE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` (+ optional `GOOGLE_SHEETS_SPREADSHEET_ID`, `CRON_SECRET`) |
+| **Column map (P0)** | **Required:** `phone_number`→mobile (10 digits), `id`→external_id, `full_name`→name, `lead_status`. **Ignore:** ad_id/adset_*/campaign_id/form_id/is_organic. **Optional:** platform, campaign_name, ad_name, created_time, final decision/remarks. See MD “Sheet columns”. |
+| **Dedupe** | By `external_id` and/or mobile per sheet source |
+| **Assign** | From `dealer_ids` on source via `BACKEND_ASSIGN_UNASSIGNED.ts` — **not** from sheet columns |
+| **Socket** | `calling:uploads-updated` after sync |
+| **Auto-sync (P0)** | Cron every **15 min** → `POST /hr/sheet-sources/sync-all` (enabled tabs only) + emit socket. Do **not** rely on socket alone to pull from Google Sheets. |
+| **Manual** | Keep `POST /hr/sheet-sources/:id/sync` for **Sync now** |
+| **Lead fields** | Echo `leadStatus`, `finalDecision`, remarks, mobile, name, assignedDealer* (status filter chips are client-side) |
+
+### Security
+
+- **Never** commit service account JSON to frontend repo.
+- Rotate key if exposed; credentials backend-only.
+
+### QA
+
+1. Spreadsheet has 4 tabs → Discover returns **exactly those 4** names; GET `/hr/sheet-sources` also returns **4** (no stale tabs).
+2. Rename/delete a Google tab → Discover again → old name gone from GET list.
+3. Enable tab + select dealers → PATCH saves pool.
+4. Sync imports rows with valid 10-digit mobile.
+5. Re-sync skips duplicate mobile.
+6. HR Social Media shows coloured status cards + New/Pending/Not interested/Interested filters.
+7. Dealer Calling Data shows assigned social leads.
+8. `GET /hr/leads/uploads` includes `google_sheet` batches.
+9. Cron every 15 min syncs enabled tabs; HR UI updates without clicking Sync now (socket or soft refresh).
+
+---
+
+## 42. Workflow dashboard parity (Installation / Metering / Final confirmation) — Sep 2026
+
+### Frontend
+
+Individual dashboards now match Admin UI (tables, sub-tabs, overdue, permission scopes):
+
+- **Installation:** `app/dashboard/installer/page.tsx`, `lib/load-operational-installation-rows.ts`
+- **Metering:** `components/metering/metering-workflow-panel.tsx` (installer + metering role)
+- **Final confirmation:** `components/final-confirmation-workflow-panel.tsx`, `app/dashboard/baldev/page.tsx`
+
+Spec: **`BACKEND_WORKFLOW_DASHBOARD_PARITY.md`**, **`BACKEND_WORKFLOW_DASHBOARD_PARITY.ts`**, REQUIRED **§AK**
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| **Scope semantics** | `everyone` = all workflow rows; `selected_users` = `dealerId` ∈ `selectedUserIds`; `office_only` = office match or own dealer |
+| **GET /admin/quotations** | Allow non-admin when user has `installation` / `metering` / `final_confirmation` (or `accounts`) access + `scope: everyone` + level ≠ `none` — return **all dealers**, not `dealerId = req.user.id`. SPA tries this route first via `getWorkflowDashboardList()`. |
+| **List fields** | Echo `dealerId`, `officeLocation`, install/metering/final workflow fields, final doc URLs (see parity doc §3) |
+| **Final approve** | `PATCH` operational status → `baldev_approved` for `final_confirmation` write users |
+| **Final docs** | `POST /quotations/:id/final-confirmation-documents` (4 files) |
+| **Login** | Echo `moduleFieldPermissions` + `officeLocation` |
+
+### Optional routes (instead of expanding admin auth)
+
+- `GET /installation/quotations`
+- `GET /metering/quotations`
+- `GET /final-confirmation/quotations`
+
+### QA
+
+1. Account manager + Installation **Everyone** → installer table row count matches Admin Installation (all dealers).
+2. Metering **Selected one** with two dealer UUIDs → only those dealers in Meter Pending.
+3. Final confirmation **write** → final docs upload + `baldev_approved` PATCH succeed.
+
+---
+
+## 43. Customer Journey — default **Today** + fast dated calling-actions (Sep 2026)
+
+### Frontend
+
+- Admin → **Customer Journey** defaults date filter to **Today**
+- Lists **20 rows**, then loads more on scroll
+- Reloads calling-actions when date filter changes
+- Code: `components/full-customer-journey-panel.tsx`, `lib/journey-calling-actions.ts` → `loadJourneyCallingActionsForAdmin`
+
+### Backend must do (P0)
+
+| Item | Detail |
+|------|--------|
+| **Honour `range`** | `GET /admin/calling-actions?range=daily\|weekly\|monthly\|last_month\|all\|custom` (same as Calling Reports) |
+| **Custom / today bounds** | Accept `startDate` / `endDate` (ISO) and/or `fromDate` / `toDate` (`YYYY-MM-DD`) |
+| **Default speed** | SPA opens with `range=daily` (Today). Must return quickly — do **not** force all-time scan |
+| **Pagination** | `page` + `limit` (SPA uses 250). Return `pagination.total`. Cap pages for daily (~8) is fine |
+| **Row fields** | Every row: `id`, `leadId`, `mobile`, `dealerId`, `dealerName`, `action`, **`actionAt` (ISO-8601)**, `callRemark`, `statusText` / `statusCategory` |
+| **Optional** | Dedicated `GET /admin/customer-journey?startDate=&endDate=&page=&limit=20` (see `BACKEND_CUSTOMER_JOURNEY.ts`) |
+
+### Do not
+
+- Ignore `range=daily` and still scan all history
+- Omit `actionAt` / `mobile` on bulk rows (forces slow per-mobile search)
+
+### QA
+
+1. Open Customer Journey → first paint in a few seconds with **Today** rows (not endless loading).
+2. Change filter to **This week** / **All time** → network shows matching `range` / dates.
+3. Scroll list → UI shows next 20 without reloading the whole API.
+4. Calling Data / Calling Action chips show date+time when actions exist (§34).
+
+---
+
+## 44. HR Social Media — sheet APIs + lead status fields (Sep 2026)
+
+### Frontend (already live)
+
+- HR → **Assignment / Social Media / Uploaded Data / Dealer Actions** (4 top tabs always visible)
+- Social Media: Discover sheet tabs, Enable, dealer pool, Sync
+- Lead status filter chips: **New / Pending / Not interested / Interested** (client-side from echoed fields)
+- Spec: **`BACKEND_GOOGLE_SHEETS_SOCIAL_LEADS.md`**, **`BACKEND_GOOGLE_SHEETS_SOCIAL_LEADS.ts`**, HANDOFF **§41**
+
+### Backend must do (P0) — if not already shipped
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/hr/sheet-sources` | List sources + counts — **only tabs that still exist in Google Sheets** |
+| `POST` | `/hr/sheet-sources/discover` | Body `{ spreadsheetId }` → return exact Google tab titles; upsert; **delete stale** `hr_sheet_sources` |
+| `PATCH` | `/hr/sheet-sources/:id` | `{ enabled, dealerIds, activeLimitPerDealer }` |
+| `POST` | `/hr/sheet-sources/:id/sync` | Pull Google Sheet → `hr_leads` + upload batch → round-robin |
+| `POST` | `/hr/sheet-sources/sync-all` | **P0 auto-sync** — enabled tabs only; auth HR JWT **or** `x-cron-secret`; emit socket |
+| `GET` | `/hr/sheet-sources/:id/leads` | Paginated leads for UI |
+
+**Current live tabs (Sep 2026 sheet):** `Jaipur Leads`, `Ajmer Leads`, `Crompton Leads`, `Ajmer Solar Lead Form New`
+
+**Auth:** `hr` · **Env:** `GOOGLE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` · `CRON_SECRET` · `GOOGLE_SHEETS_SPREADSHEET_ID` · share sheet with SA email as Editor.
+
+**Cron (P0):** every 15 min → `POST /hr/sheet-sources/sync-all` with `x-cron-secret` → then `calling:uploads-updated`. Copy-paste: `postHrSheetSourcesSyncAll` in `BACKEND_GOOGLE_SHEETS_SOCIAL_LEADS.ts`.
+
+**Discover prune (copy from `BACKEND_GOOGLE_SHEETS_SOCIAL_LEADS.ts` → `discoverHrSheetTabs`):**
+
+```text
+1. sheets.spreadsheets.get → tab titles[]
+2. findOrCreate each title for spreadsheet_id
+3. DELETE hr_sheet_sources WHERE spreadsheet_id = ? AND sheet_tab_name NOT IN (titles)
+4. Respond { tabs, sources } for those titles only
+```
+
+**Meta column map (Ajmer Solar Lead Form New — P0):**
+
+| Sheet | DB / API | Role |
+|-------|----------|------|
+| `phone_number` (`p:+91…`) | `mobile` (last 10) | **Required** — skip invalid |
+| `id` (`l:…`) | `external_id` | **Required** — dedupe |
+| `full_name` | `name` | **Required** |
+| `lead_status` (`CREATED`) | `lead_status` | **Required** — New vs Pending |
+| `platform`, `campaign_name`, `ad_name`, `created_time` | same | Optional display |
+| `ad_id`, `adset_*`, `campaign_id`, `form_id`, `is_organic` | — | **Ignore** (raw_json OK) |
+| — | `dealer_ids` on source | **Assign** — not from sheet |
+
+**Echo on lead rows (for status colours / filters):**
+
+| Field | Used for |
+|-------|----------|
+| `leadStatus` / `lead_status` | New (CREATED) vs Pending |
+| `finalDecision` / `final_decision` | Not interested / Interested |
+| `finalDecisionReason` / remarks | Visit / not interested text |
+| `mobile`, `name`, `platform`, `campaignName`, `address`, `kw` | Card display |
+| `assignedDealerId` / `assignedDealerName` | Who got the lead |
+| `source_type=google_sheet` on upload batch | Uploaded Data + Calling Data |
+
+**Socket:** `calling:uploads-updated` after sync.
+
+### Frontend-only (no backend)
+
+- 4 HR top tabs layout (Assignment / Social Media / Uploaded Data / Dealer Actions)
+- Lead status filter chips (derived from fields above)
+- Client prune of stale tabs after Discover (still requires backend prune so refresh stays correct)
+
+### QA
+
+1. Discover returns tabs including `Ajmer_Leads` / city tabs.
+2. Enable + save dealers → Sync imports mobiles.
+3. Social Media lead cards colour correctly; status filter counts match.
+4. Assigned leads appear in dealer Calling Data.
+5. Credentials never in frontend repo.
+
+---
+
+

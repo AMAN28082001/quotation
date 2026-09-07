@@ -36,6 +36,12 @@ Installer/Admin upload photos  ──PATCH──►  installation_status=install
                                               ▼
                                    GET /admin/quotations  ──►  Approved Installation tab
 
+Admin [Revert]  ──PATCH──►  installation_status=pending_installer
+                            (quotation.status unchanged; photos kept)
+                                              │
+                                              ▼
+                                   GET /admin/quotations  ──►  Pending Installation tab
+
 Admin [Send to Metering]  ──PATCH──►  installation_status=pending_metering
                                               │
                                               ▼
@@ -201,11 +207,27 @@ PATCH /api/admin/quotations/:id/installation-status
 { "installationStatus": "pending_metering" }
 ```
 
-**Revert to pending:**
+**Revert to pending (admin — required):**
 
 ```
-{ "installationStatus": "pending_installer" }
+PATCH /api/admin/quotations/:id/installation-status
+{
+  "installationStatus": "pending_installer",
+  "force": true,
+  "adminOverride": true,
+  "allowRevert": true
+}
 ```
+
+Allowed from `installer_approved` or `installer_partial_approved` (idempotent if already `pending_installer`).
+
+- Set **`installation_status = pending_installer`**.
+- Do **not** change quotation **`status`** (`approved` stays `approved`).
+- Clear **`installer_approved_at`**, **`installation_partial_approved`**.
+- Keep uploaded photos.
+- Remove id from `GET …/installer/quotations?status=approved`; add to `?status=pending_installer`.
+
+Full spec: **`BACKEND_INSTALLATION_REVERT.ts`**, HANDOFF **§35**, REQUIRED **§AH**.
 
 Return updated `installationStatus` in response body.
 
@@ -298,6 +320,37 @@ After backfill, `GET /admin/quotations` must return the updated fields.
 
 ## 13. Related docs
 
-- `BACKEND_CHANGES_HANDOFF.md` — §9  
-- `BACKEND_CHANGES_REQUIRED.md` — Installation release & planned date, §M  
+- `BACKEND_CHANGES_HANDOFF.md` — §9, **§40** (Retrieve from Installation)  
+- `BACKEND_CHANGES_REQUIRED.md` — Installation release & planned date, **§AM**  
+- `BACKEND_RETRIEVE_FROM_INSTALLATION.ts` — undo Send to Installer handler  
 - `BACKEND_ADMIN_QUOTATION_STATUS.ts` — reference PATCH/serializer code  
+
+---
+
+## 14. Retrieve from Installation (undo Send to Installer) — Sep 2026
+
+**UI:** Admin Installation **Revert** (↺) on Pending/Partial/In progress; Accounts **Revert** when badge shows **Sent to installer**.
+
+**Effect:** Clear `installation_ready_for_installer` and `installation_released_at`. Row leaves Installation tab; Accounts can **Send to Installer** again.
+
+**Preferred route:**
+
+```
+PATCH /api/quotations/{id}/installation-release
+{
+  "installationReadyForInstaller": false,
+  "installation_ready_for_installer": false,
+  "installationReleasedAt": null,
+  "installation_released_at": null,
+  "retrieveFromInstallation": true,
+  "allowRevert": true
+}
+```
+
+Or dedicated: `PATCH /api/admin/quotations/{id}/retrieve-from-installation`
+
+**Must not:** wipe `installments` / payment phases on this PATCH (merge release fields only).
+
+**Block when:** `metering_approved`, `mco`, `meter_installation_pending`, etc. → **409**.
+
+**Not the same as:** Approved Installation **Revert** (`installer_approved` → `pending_installer`) — see `BACKEND_INSTALLATION_REVERT.ts`.

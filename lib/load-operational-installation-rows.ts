@@ -36,7 +36,8 @@ export async function loadOperationalInstallationRows(
   options: LoadOperationalInstallationRowsOptions = {},
 ): Promise<LoadOperationalInstallationRowsResult> {
   const fetchAdmin = options.fetchAdminQuotationList !== false
-  const getById = options.getQuotationById ?? ((id: string) => api.quotations.getById(id))
+  const getById = options.getQuotationById ??
+    ((id: string) => api.quotations.getById(id, { suppressErrorLog: true }))
 
   let releaseLocal = readInstallerReleaseMap()
   const installerQueueById: Record<string, Record<string, unknown>> = {}
@@ -57,7 +58,7 @@ export async function loadOperationalInstallationRows(
   let adminRowsRaw: unknown[] = []
   if (fetchAdmin) {
     try {
-      const quotationsResponse = await api.admin.quotations.getAll({ page: 1, limit: 1000 })
+      const quotationsResponse = await api.quotations.getWorkflowDashboardList({ page: 1, limit: 1000 })
       adminRowsRaw =
         (quotationsResponse as { quotations?: unknown[] }).quotations ||
         extractQuotationListFromApiResponse(quotationsResponse)
@@ -66,12 +67,14 @@ export async function loadOperationalInstallationRows(
     }
   }
 
+  const installerQueueOptions = { suppressErrorLog: true as const }
+
   try {
     const pending = extractQuotationListFromApiResponse(
-      await api.installer.getQueue({ status: "pending_installer", page: 1, limit: 1000 }),
+      await api.installer.getQueue({ status: "pending_installer", page: 1, limit: 1000 }, installerQueueOptions),
     )
     const approvedQ = extractQuotationListFromApiResponse(
-      await api.installer.getQueue({ status: "approved", page: 1, limit: 1000 }),
+      await api.installer.getQueue({ status: "approved", page: 1, limit: 1000 }, installerQueueOptions),
     )
     ingestInstallerQueueRows(pending)
     ingestInstallerQueueRows(approvedQ)
@@ -84,7 +87,7 @@ export async function loadOperationalInstallationRows(
       try {
         ingestInstallerQueueRows(
           extractQuotationListFromApiResponse(
-            await api.installer.getQueue({ status, page: 1, limit: 1000 }),
+            await api.installer.getQueue({ status, page: 1, limit: 1000 }, installerQueueOptions),
           ),
         )
       } catch {
@@ -93,7 +96,9 @@ export async function loadOperationalInstallationRows(
     }
     if (Object.keys(installerQueueById).length === 0) {
       ingestInstallerQueueRows(
-        extractQuotationListFromApiResponse(await api.installer.getQueue({ page: 1, limit: 1000 })),
+        extractQuotationListFromApiResponse(
+          await api.installer.getQueue({ page: 1, limit: 1000 }, installerQueueOptions),
+        ),
       )
     }
   } catch {
@@ -158,7 +163,10 @@ export async function loadOperationalInstallationRows(
       ? paymentSentRows
       : await (async () => {
           try {
-            const approvedResp = await api.quotations.getAll({ status: "approved", page: 1, limit: 1000 })
+            const approvedResp = await api.quotations.getAll(
+              { status: "approved", page: 1, limit: 1000 },
+              { suppressErrorLog: true },
+            )
             return extractQuotationListFromApiResponse(approvedResp)
           } catch {
             return [] as unknown[]

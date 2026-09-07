@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState, Fragment } from "react"
 import { useRouter } from "next/navigation"
 import { useAuth } from "@/lib/auth-context"
 import { Button } from "@/components/ui/button"
@@ -9,35 +9,32 @@ import { SolarLogo } from "@/components/solar-logo"
 import {
   LogOut,
   Wrench,
-  CheckCircle2,
   Clock3,
   Search,
-  CalendarDays,
-  Gauge,
+  Calendar,
   Edit,
   ChevronDown,
   Users,
-  Package,
+  History,
+  Eye,
+  RotateCcw,
 } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { InstallationTeamsDialog } from "@/components/installation-teams-dialog"
-import { MeteringWorkflowPanel } from "@/components/metering/metering-workflow-panel"
-import { SuperAdminInventoryPanel } from "@/components/inventory/super-admin-inventory-panel"
-import { buildInventoryAuthUserFromQuotationSession } from "@/lib/admin-access"
-import { authService as inventoryAuthService } from "@/inventory-sa/lib/auth"
-import { resolveApiBaseUrl } from "@/lib/resolve-api-base-url"
-import { api, apiErrorToUserMessage, getAuthToken, sendQuotationToMetering, ApiError } from "@/lib/api"
+import { api, apiErrorToUserMessage, ApiError, retrieveQuotationFromInstallation } from "@/lib/api"
 import { useToast } from "@/hooks/use-toast"
 import { formatPersonName } from "@/lib/name-display"
 import { confirmSave } from "@/lib/confirm-save"
+import { DebouncedSearchInput } from "@/components/debounced-search-input"
+import { InstallationStatusTimelineDialog } from "@/components/installation-status-timeline-dialog"
+import { InstallationPhotosViewerDialog } from "@/components/installation-photos-viewer-dialog"
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import {
   InstallationCompletionPanel,
   type InstallationUploadedFile,
 } from "@/components/installation-completion-panel"
-import { InstallationPublicPhoto } from "@/components/installation-public-photo"
 import {
   gatherInstallationPublicImageUrls,
   INSTALLATION_APPROVED_MEDIA_STATUSES,
@@ -46,8 +43,9 @@ import {
 import { loadOperationalInstallationRows } from "@/lib/load-operational-installation-rows"
 import {
   addCalendarDaysFromDateString,
+  flattenWrappedQuotationRow,
+  getAdminInstallationTabRevertState,
   getInstallationWorkflowStatus,
-  getSendToMeteringMenuState,
   mergeInstallationMediaSources,
   mergeInstallerReleaseOntoQuotation,
   readInstallerReleaseMap,
@@ -55,7 +53,18 @@ import {
   isInstallationPartialApproved,
   getInstallationAdminTabProgress,
   toYmdFromStored,
+  setInstallationScheduledDateInLocalMap,
 } from "@/lib/operational-install-queue"
+import {
+  installationOverdueTone,
+  installerQueueStatusDisplayLabel,
+  installerStageBadgeTone,
+  matchesOverdueToneFilter,
+  overdueRowClasses,
+  resolveInstallationScheduleYmd,
+  type InstallOverdueFilter,
+} from "@/lib/installation-overdue-ui"
+import { cn } from "@/lib/utils"
 import {
   loadInstallationTeamsList,
   persistInstallationTeamAssignment,
@@ -63,6 +72,13 @@ import {
 import { getInstallationTeamIdForQuotation, type InstallationTeamRecord } from "@/lib/installation-teams"
 import { AccessSwitchBar } from "@/components/access-switch-bar"
 import { canOpenSection, getAccessOptions, getPostLoginPath } from "@/lib/user-access"
+import { isWorkflowModuleReadOnly, filterQuotationsByWorkflowPermission, shouldLoadAllWorkflowQuotations } from "@/lib/module-field-permissions"
+import {
+  INSTALLATION_IMAGE_FIELDS,
+  type InstallationImageFieldKey,
+  isInstallationImageFieldMultiple,
+  isInstallationImageFieldRequired,
+} from "@/lib/installation-image-fields"
 
 type InstallerQuotation = {
   id: string
@@ -123,27 +139,6 @@ type InstallerWorkflowItem = {
   imageNames?: string[]
   updatedAt: string
 }
-
-const INSTALLATION_IMAGE_FIELDS = [
-  { key: "homeFrontPhoto", label: "Front Photo of Home" },
-  { key: "homeWithPersonPhoto", label: "Front Photo of Home with person" },
-  { key: "inverterWithCustomerPhoto", label: "Inverter Photo with customer" },
-  { key: "plantWithCustomerPhoto", label: "Plant photo with Customer" },
-  { key: "inverterSerialNumberPhoto", label: "Inverter Photo with Serial No" },
-  { key: "panelSerialNumberPhoto", label: "Panels photo with Serial No", multiple: true },
-  { key: "geoTagPlantPhoto", label: "GeoTag photo with plants" },
-  { key: "otherImages", label: "Others Images", multiple: true, required: false },
-] as const
-
-type InstallationImageFieldKey = (typeof INSTALLATION_IMAGE_FIELDS)[number]["key"]
-
-type ImageFieldConfig = (typeof INSTALLATION_IMAGE_FIELDS)[number] & { required?: boolean; multiple?: boolean }
-
-const isImageFieldRequired = (field: (typeof INSTALLATION_IMAGE_FIELDS)[number]) =>
-  (field as ImageFieldConfig).required !== false
-
-const isImageFieldMultiple = (field: (typeof INSTALLATION_IMAGE_FIELDS)[number]) =>
-  (field as ImageFieldConfig).multiple === true
 
 const CM_PER_FT = 30.48
 
@@ -235,16 +230,13 @@ const installerQuotationFromApiRecord = (raw: unknown): InstallerQuotation => {
   return { ...flat, products } as InstallerQuotation
 }
 
-/** Top-level areas on the installation dashboard, mirroring Admin's Metering + Inventory. */
-type InstallerSection = "installation" | "metering" | "inventory"
-
 export default function InstallerDashboardPage() {
   const router = useRouter()
-  const { isAuthenticated, role, installer, installationTeamUser, logout, access } = useAuth()
+  const { isAuthenticated, role, installer, installationTeamUser, logout, access, modulePermissions, officeLocation, dealer, accountManager } = useAuth()
   const { toast } = useToast()
   const [isLoading, setIsLoading] = useState(true)
-  const [activeSection, setActiveSection] = useState<InstallerSection>("installation")
-  const [activeTab, setActiveTab] = useState<"all" | "pending" | "partial" | "approved">("pending")
+  const [activeTab, setActiveTab] = useState<"all" | "pending" | "partial" | "done">("pending")
+  const [filterInstallOverdue, setFilterInstallOverdue] = useState<InstallOverdueFilter>("all")
   const [searchTerm, setSearchTerm] = useState("")
   const [quotations, setQuotations] = useState<InstallerQuotation[]>([])
   const [expandedQuotationId, setExpandedQuotationId] = useState<string | null>(null)
@@ -258,8 +250,14 @@ export default function InstallerDashboardPage() {
     Record<string, { length: string; width: string; height: string }>
   >({})
   const [savingId, setSavingId] = useState<string | null>(null)
-  const [sendingToMeteringId, setSendingToMeteringId] = useState<string | null>(null)
   const [loadingDetailsForId, setLoadingDetailsForId] = useState<string | null>(null)
+  const [statusHistoryQuotation, setStatusHistoryQuotation] = useState<InstallerQuotation | null>(null)
+  const [installPhotosViewer, setInstallPhotosViewer] = useState<InstallerQuotation | null>(null)
+  const [installPhotoUrls, setInstallPhotoUrls] = useState<string[]>([])
+  const [installPhotosLoading, setInstallPhotosLoading] = useState(false)
+  const [retrievingFromInstallationId, setRetrievingFromInstallationId] = useState<string | null>(null)
+  const [installRevertTarget, setInstallRevertTarget] = useState<{ id: string; label: string } | null>(null)
+  const [installRevertSaving, setInstallRevertSaving] = useState(false)
   const [workflowMap, setWorkflowMap] = useState<Record<string, InstallerWorkflowItem>>({})
   const [installerQueueApprovedIds, setInstallerQueueApprovedIds] = useState<Set<string>>(() => new Set())
   const [uploadingAssetKey, setUploadingAssetKey] = useState<string | null>(null)
@@ -268,6 +266,23 @@ export default function InstallerDashboardPage() {
   const [installationTeamsRefresh, setInstallationTeamsRefresh] = useState(0)
   const useApi = process.env.NEXT_PUBLIC_USE_API !== "false"
   const canManageInstallationTeams = role === "installer"
+  const sessionUserId =
+    dealer?.id ?? accountManager?.id ?? installer?.id ?? installationTeamUser?.id ?? undefined
+  const installationReadOnly = isWorkflowModuleReadOnly(modulePermissions, "installation", {
+    userId: sessionUserId,
+    officeLocation,
+    viewerIsDealer: role === "dealer",
+    viewerIsAdmin: role === "admin" || role === "super-admin",
+  })
+  const permissionCtx = useMemo(
+    () => ({
+      userId: sessionUserId,
+      officeLocation,
+      viewerIsDealer: role === "dealer",
+      viewerIsAdmin: role === "admin" || role === "super-admin",
+    }),
+    [sessionUserId, officeLocation, role],
+  )
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -302,47 +317,6 @@ export default function InstallerDashboardPage() {
     if (!canManageInstallationTeams) return
     void loadInstallationTeamsList(useApi).then(setInstallationTeams)
   }, [useApi, canManageInstallationTeams, installationTeamsRefresh])
-
-  const inventoryDisplayName =
-    [installer?.firstName, installer?.lastName].filter(Boolean).join(" ").trim() ||
-    installer?.username ||
-    installationTeamUser?.teamName ||
-    installationTeamUser?.username ||
-    (role === "installation-team" ? "Installation team" : "Installer")
-
-  const getInventoryToken = useCallback(
-    () =>
-      getAuthToken() ||
-      inventoryAuthService.getToken() ||
-      (typeof window !== "undefined"
-        ? localStorage.getItem("authToken") || localStorage.getItem("auth_token")
-        : null),
-    [],
-  )
-
-  // Reuse the installer JWT for inventory APIs so no second login is needed.
-  useEffect(() => {
-    if (activeSection !== "inventory") return
-    const token = getInventoryToken()
-    if (!token) return
-    const sessionUser = installer || installationTeamUser
-    inventoryAuthService.setToken(token)
-    inventoryAuthService.setUser(
-      buildInventoryAuthUserFromQuotationSession({
-        id: (sessionUser as { id?: string })?.id || "installer",
-        username: (sessionUser as { username?: string })?.username || "installer",
-        name: inventoryDisplayName,
-        role: role || "installer",
-        isActive: true,
-        loginUser: {
-          role: role || "installer",
-          inventoryAccess: true,
-          requiresInventoryLogin: false,
-          inventoryRole: "super-admin",
-        },
-      }),
-    )
-  }, [activeSection, getInventoryToken, installer, installationTeamUser, inventoryDisplayName, role])
 
   const handlePersistInstallationTeamAssignment = async (quotationId: string, teamId: string) => {
     const normalized = teamId.trim() || undefined
@@ -380,8 +354,13 @@ export default function InstallerDashboardPage() {
       setIsLoading(true)
       try {
         if (useApi) {
+          const loadAllInstallation = shouldLoadAllWorkflowQuotations(
+            modulePermissions,
+            "installation",
+            permissionCtx,
+          )
           const { rows, installerQueueApprovedIds: approvedIds } = await loadOperationalInstallationRows({
-            fetchAdminQuotationList: true,
+            fetchAdminQuotationList: loadAllInstallation,
             filterTeamId:
               role === "installation-team" && installationTeamUser?.teamId
                 ? String(installationTeamUser.teamId)
@@ -426,7 +405,7 @@ export default function InstallerDashboardPage() {
       }
     }
     void loadInstallationQuotations()
-  }, [toast, useApi, role, installationTeamUser?.teamId])
+  }, [toast, useApi, role, installationTeamUser?.teamId, modulePermissions, permissionCtx])
 
   useEffect(() => {
     if (!useApi) return
@@ -520,8 +499,9 @@ export default function InstallerDashboardPage() {
   }
 
   const getDealerDisplay = (q: InstallerQuotation) => {
-    const nested = q.dealer
-    if (nested) {
+    const qAny = q as Record<string, unknown>
+    const nested = (q.dealer || qAny.dealer) as { firstName?: string; lastName?: string; mobile?: string } | undefined
+    if (nested && typeof nested === "object") {
       return {
         name: formatPersonName(nested.firstName, nested.lastName, "Dealer"),
         mobile: nested.mobile || "—",
@@ -530,27 +510,23 @@ export default function InstallerDashboardPage() {
     return { name: "—", mobile: "—" }
   }
 
-  const getInstallationDateLabel = (q: InstallerQuotation) => {
-    const qAny = q as Record<string, unknown>
-    const sentToInstallationAt = qAny.installationReleasedAt || qAny.installation_released_at || getAdminApprovedDate(q)
-    const sentBaseStr = sentToInstallationAt ? String(sentToInstallationAt) : ""
-    const sentParsedOk = sentBaseStr ? !Number.isNaN(new Date(sentBaseStr).getTime()) : false
-    const defaultInstallYmd = sentParsedOk ? addCalendarDaysFromDateString(sentBaseStr, 7) : ""
-    const storedInstallYmd = toYmdFromStored(
-      (qAny.installationScheduledAt || qAny.installation_scheduled_at) as string | undefined,
-    )
-    const ymd = storedInstallYmd || defaultInstallYmd
-    if (!ymd) return "N/A"
-    const parsed = new Date(`${ymd}T12:00:00`)
-    return Number.isNaN(parsed.getTime()) ? ymd : parsed.toLocaleDateString("en-IN")
-  }
-
   const normalizedSearch = searchTerm.trim().toLowerCase()
+
+  const permissionVisibleQuotations = useMemo(
+    () =>
+      filterQuotationsByWorkflowPermission(
+        quotations as Record<string, unknown>[],
+        modulePermissions,
+        "installation",
+        permissionCtx,
+      ) as InstallerQuotation[],
+    [quotations, modulePermissions, permissionCtx],
+  )
 
   const sortedQuotations = useMemo(() => {
     // All Account → Send to Installer rows stay visible (including after Send to Metering).
     // Do not collapse to current-quotation-only — that would drop the installed file.
-    return [...quotations]
+    return [...permissionVisibleQuotations]
       .filter((q) => {
         if (!normalizedSearch) return true
         const fullName = formatPersonName(q.customer?.firstName, q.customer?.lastName, "").toLowerCase()
@@ -561,7 +537,7 @@ export default function InstallerDashboardPage() {
         )
       })
       .sort((a, b) => toTimestamp(getAdminApprovedDate(a)) - toTimestamp(getAdminApprovedDate(b)))
-  }, [quotations, normalizedSearch])
+  }, [permissionVisibleQuotations, normalizedSearch])
 
   const pendingQuotations = useMemo(
     () =>
@@ -583,11 +559,35 @@ export default function InstallerDashboardPage() {
   )
 
   const activeInstallationList = useMemo(() => {
-    if (activeTab === "pending") return pendingQuotations
-    if (activeTab === "partial") return partialQuotations
-    if (activeTab === "approved") return approvedQuotations
-    return sortedQuotations
-  }, [activeTab, pendingQuotations, partialQuotations, approvedQuotations, sortedQuotations])
+    let list: InstallerQuotation[]
+    if (activeTab === "pending") list = pendingQuotations
+    else if (activeTab === "partial") list = partialQuotations
+    else if (activeTab === "done") list = approvedQuotations
+    else list = sortedQuotations
+
+    if (filterInstallOverdue === "all" || activeTab === "done") return list
+
+    return list.filter((q) => {
+      const installerStatus = getInstallerStatus(q)
+      if (installerStatus === "approved") return false
+      const qAny = q as Record<string, unknown>
+      const sentToInstallationAt =
+        qAny.installationReleasedAt || qAny.installation_released_at || getAdminApprovedDate(q)
+      const sentBaseStr = sentToInstallationAt ? String(sentToInstallationAt) : ""
+      const installYmd = resolveInstallationScheduleYmd(qAny, sentBaseStr)
+      const tone = installationOverdueTone(installYmd, installerStatus)
+      return matchesOverdueToneFilter(tone, filterInstallOverdue)
+    })
+  }, [
+    activeTab,
+    pendingQuotations,
+    partialQuotations,
+    approvedQuotations,
+    sortedQuotations,
+    filterInstallOverdue,
+    workflowMap,
+    installerQueueApprovedIds,
+  ])
 
   const openUploadPanel = (q: InstallerQuotation) => {
     ensureInstallerDraftData(q)
@@ -837,19 +837,133 @@ export default function InstallerDashboardPage() {
     }
   }
 
-  const setInProgress = (quotation: InstallerQuotation) => {
-    const quotationId = quotation.id
-    setWorkflowMap((prev) => ({
-      ...prev,
-      [quotationId]: {
-        ...(prev[quotationId] || {}),
-        status: "inprogress",
-        updatedAt: new Date().toISOString(),
-      },
-    }))
-    ensureInstallerDraftData(quotation)
-    setExpandedQuotationId(quotationId)
-    void hydrateQuotationDetails(quotation)
+  const startInstallationInProgress = (quotation: InstallerQuotation) => {
+    void (async () => {
+      if (useApi) {
+        try {
+          await api.admin.quotations.updateOperationalStatus(quotation.id, "installer_in_progress")
+        } catch {
+          // installer JWT may lack admin route — upload panel may still force start
+        }
+      }
+      setWorkflowMap((prev) => ({
+        ...prev,
+        [quotation.id]: {
+          ...(prev[quotation.id] || {}),
+          status: "inprogress",
+          updatedAt: new Date().toISOString(),
+        },
+      }))
+      openUploadPanel(quotation)
+    })()
+  }
+
+  const openInstallPhotosViewer = (quotation: InstallerQuotation) => {
+    setInstallPhotosViewer(quotation)
+    setInstallPhotoUrls(gatherInstallationPublicImageUrls(quotation as Record<string, unknown>, 24))
+    setInstallPhotosLoading(true)
+    if (!useApi) {
+      setInstallPhotosLoading(false)
+      return
+    }
+    void (async () => {
+      try {
+        const full = flattenWrappedQuotationRow(await api.quotations.getById(quotation.id))
+        const merged = mergeInstallationMediaSources(quotation as Record<string, unknown>, full)
+        setInstallPhotoUrls(gatherInstallationPublicImageUrls(merged as Record<string, unknown>, 24))
+      } catch {
+        // keep list-row URLs
+      } finally {
+        setInstallPhotosLoading(false)
+      }
+    })()
+  }
+
+  const handleRetrieveFromInstallation = async (quotation: InstallerQuotation) => {
+    const installerStatus = getInstallerStatus(quotation)
+    const revertState = getAdminInstallationTabRevertState(
+      quotation as Record<string, unknown>,
+      installerStatus,
+      readInstallerReleaseMap(),
+    )
+    if (retrievingFromInstallationId === quotation.id) return
+    if (!revertState.enabled) {
+      toast({
+        title: "Cannot retrieve",
+        description: revertState.hint || "This quotation cannot be pulled back to Accounts.",
+        variant: "destructive",
+      })
+      return
+    }
+    if (!confirmSave(`Retrieve ${quotation.id} from Installation back to Accounts?\n\nThis undoes Send to Installer.`)) {
+      return
+    }
+    setRetrievingFromInstallationId(quotation.id)
+    try {
+      if (useApi) {
+        const ok = await retrieveQuotationFromInstallation(quotation.id)
+        if (!ok) {
+          toast({
+            title: "Retrieve failed",
+            description: "Could not clear installation release on the server.",
+            variant: "destructive",
+          })
+          return
+        }
+      }
+      setQuotations((prev) => prev.filter((q) => q.id !== quotation.id))
+      toast({ title: "Retrieved", description: "Quotation moved back to Accounts." })
+    } catch (error) {
+      toast({
+        title: "Retrieve failed",
+        description: error instanceof ApiError ? error.message : apiErrorToUserMessage(error),
+        variant: "destructive",
+      })
+    } finally {
+      setRetrievingFromInstallationId(null)
+    }
+  }
+
+  const confirmRevertInstallationToPending = async () => {
+    if (!installRevertTarget) return
+    const { id } = installRevertTarget
+    setInstallRevertSaving(true)
+    try {
+      if (useApi) {
+        try {
+          await api.admin.quotations.revertInstallationToPending(id)
+        } catch {
+          await api.admin.quotations.updateOperationalStatus(id, "pending_installer")
+        }
+      }
+      setInstallerQueueApprovedIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+      setQuotations((prev) =>
+        prev.map((q) =>
+          q.id === id
+            ? ({
+                ...q,
+                installationStatus: "pending_installer",
+                installation_status: "pending_installer",
+              } as InstallerQuotation)
+            : q,
+        ),
+      )
+      setExpandedQuotationId((prev) => (prev === id ? null : prev))
+      setInstallRevertTarget(null)
+      toast({ title: "Reverted", description: "Moved back to Pending Installation." })
+    } catch (error) {
+      toast({
+        title: "Revert failed",
+        description: error instanceof ApiError ? error.message : apiErrorToUserMessage(error),
+        variant: "destructive",
+      })
+    } finally {
+      setInstallRevertSaving(false)
+    }
   }
 
   const toLocalUploadedFile = (file: File): InstallationUploadedFile => ({
@@ -899,7 +1013,7 @@ export default function InstallerDashboardPage() {
   ) => {
     const isPartial = mode === "partial"
     const filesByField = uploadFilesByQuotation[quotation.id] || {}
-    const requiredFields = INSTALLATION_IMAGE_FIELDS.filter((field) => isImageFieldRequired(field))
+    const requiredFields = INSTALLATION_IMAGE_FIELDS.filter((field) => isInstallationImageFieldRequired(field))
     const uploadedFiles = INSTALLATION_IMAGE_FIELDS.flatMap((field) => filesByField[field.key] || [])
     const notes = uploadNotes[quotation.id] || ""
     const dimensions = dimensionsByQuotation[quotation.id] || { length: "", width: "", height: "" }
@@ -1187,14 +1301,12 @@ export default function InstallerDashboardPage() {
           },
         }))
         setExpandedQuotationId(null)
-        setActiveTab(isPartial ? "partial" : "approved")
+        setActiveTab(isPartial ? "partial" : "done")
         toast({
           title: isPartial ? "Partial Approved" : "Installation complete",
           description: isPartial
             ? "Saved under Partial Approved — finish remaining photos to move to Approved Installation."
-            : useApi
-              ? "Moved to Approved Installation — use Send to Metering when ready to hand off."
-              : "Moved to Approved Installation (saved locally). Use Send to Metering when ready.",
+            : "Moved to Approved Installation.",
         })
       } else if (useApi) {
         toast({
@@ -1205,86 +1317,6 @@ export default function InstallerDashboardPage() {
           variant: "destructive",
         })
       }
-    }
-  }
-
-  const handleSendToMetering = async (quotation: InstallerQuotation) => {
-    const menuState = getSendToMeteringMenuState(quotation as any)
-    if (sendingToMeteringId === quotation.id) return
-    if (!menuState.enabled) {
-      toast({
-        title: "Cannot send to metering",
-        description: menuState.hint || "Complete installation and ensure the quotation is approved first.",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!confirmSave(`Send ${quotation.id} to Metering and save?`)) return
-
-    setSendingToMeteringId(quotation.id)
-    try {
-      let ok = false
-      if (useApi) {
-        ok = await sendQuotationToMetering(quotation.id)
-        if (!ok) {
-          toast({
-            title: "Send to metering failed",
-            description: "The server did not accept the metering handoff. Ask admin to verify API permissions.",
-            variant: "destructive",
-          })
-          return
-        }
-      } else {
-        ok = true
-      }
-
-      if (ok) {
-        setQuotations((prev) =>
-          prev.map((row) =>
-            row.id === quotation.id
-              ? ({
-                  ...row,
-                  installationStatus: "pending_metering",
-                  installation_status: "pending_metering",
-                  meteringStatus: "pending_metering",
-                  metering_status: "pending_metering",
-                } as InstallerQuotation)
-              : row,
-          ),
-        )
-        try {
-          const localAll = JSON.parse(localStorage.getItem("quotations") || "[]")
-          if (Array.isArray(localAll)) {
-            const next = localAll.map((row: any) =>
-              row?.id === quotation.id
-                ? {
-                    ...row,
-                    installationStatus: "pending_metering",
-                    installation_status: "pending_metering",
-                    meteringStatus: "pending_metering",
-                    metering_status: "pending_metering",
-                  }
-                : row,
-            )
-            localStorage.setItem("quotations", JSON.stringify(next))
-          }
-        } catch {
-          // no-op
-        }
-        toast({
-          title: "Sent to Metering",
-          description: `${quotation.id} is now in the metering queue.`,
-        })
-      }
-    } catch (error) {
-      toast({
-        title: "Send to metering failed",
-        description: error instanceof ApiError ? error.message : apiErrorToUserMessage(error),
-        variant: "destructive",
-      })
-    } finally {
-      setSendingToMeteringId(null)
     }
   }
 
@@ -1335,104 +1367,87 @@ export default function InstallerDashboardPage() {
           )}
         </p>
 
-        <div className="w-full rounded-lg border border-border/70 bg-muted/30 p-1 flex flex-wrap gap-1">
+        <div className="mb-3 w-full rounded-lg border border-border/70 bg-muted/30 p-1 flex flex-wrap gap-1">
           {(
             [
-              { key: "installation" as const, label: "Installation", icon: Wrench },
-              { key: "metering" as const, label: "Metering", icon: Gauge },
-              { key: "inventory" as const, label: "Inventory", icon: Package },
+              { key: "all" as const, label: "All" },
+              { key: "pending" as const, label: "Pending Installation" },
+              { key: "partial" as const, label: "Partial Approved" },
+              { key: "done" as const, label: "Approved Installation" },
             ] as const
-          ).map((item) => {
-            const Icon = item.icon
-            return (
-              <Button
-                key={item.key}
-                type="button"
-                size="sm"
-                variant={activeSection === item.key ? "default" : "ghost"}
-                className={`h-9 text-sm gap-1.5 ${activeSection === item.key ? "shadow-sm" : ""}`}
-                onClick={() => setActiveSection(item.key)}
-              >
-                <Icon className="w-4 h-4" />
-                {item.label}
-              </Button>
-            )
-          })}
+          ).map((item) => (
+            <Button
+              key={item.key}
+              type="button"
+              size="sm"
+              variant={activeTab === item.key ? "default" : "ghost"}
+              className={cn("h-8", activeTab === item.key && "shadow-sm")}
+              onClick={() => setActiveTab(item.key)}
+            >
+              {item.label}
+            </Button>
+          ))}
         </div>
-
-        {activeSection === "metering" ? (
-          <MeteringWorkflowPanel
-            description={`Metering for ${inventoryDisplayName}. Same Admin → Metering stages: Meter Pending → Meter in Discom → WCC Pending → Meter Installation Pending → Final Step.`}
-          />
-        ) : activeSection === "inventory" ? (
-          <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">
-              Inventory for {inventoryDisplayName} — using your installation login (no extra login). Same panel as the
-              Admin/Super Admin inventory.
-            </p>
-            <SuperAdminInventoryPanel
-              getAuthToken={getInventoryToken}
-              apiBaseUrl={resolveApiBaseUrl()}
-              userName={inventoryDisplayName}
+        <div className="flex flex-col sm:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <DebouncedSearchInput
+              placeholder="Search by name, mobile, email, or ID..."
+              value={searchTerm}
+              onDebouncedChange={setSearchTerm}
+              className="pl-9"
+              delayMs={200}
             />
           </div>
-        ) : (
-        <>
-        <Card className="border-border/60 bg-card/90 shadow-sm">
-          <CardContent className="pt-5 space-y-3">
-            <div className="w-full rounded-lg border-2 border-sky-300/80 bg-sky-50/40 p-1.5">
-              <p className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-sky-800/80">
-                Installation (same as Admin)
-              </p>
-              <div className="flex flex-wrap gap-1">
-              {(
-                [
-                  { key: "all" as const, label: "All", count: sortedQuotations.length },
-                  { key: "pending" as const, label: "Pending Installation", count: pendingQuotations.length },
-                  { key: "partial" as const, label: "Partial Approved", count: partialQuotations.length },
-                  { key: "approved" as const, label: "Approved Installation", count: approvedQuotations.length },
-                ] as const
-              ).map((item) => (
-                <Button
-                  key={item.key}
-                  type="button"
-                  size="sm"
-                  variant={activeTab === item.key ? "default" : "ghost"}
-                  className={`h-8 text-xs gap-1.5 ${activeTab === item.key ? "shadow-sm" : ""}`}
-                  onClick={() => setActiveTab(item.key)}
-                >
-                  {item.key === "pending" ? <Clock3 className="w-3.5 h-3.5" /> : null}
-                  {item.key === "partial" ? <Edit className="w-3.5 h-3.5" /> : null}
-                  {item.key === "approved" ? <CheckCircle2 className="w-3.5 h-3.5" /> : null}
-                  {item.label} ({item.count})
-                </Button>
-              ))}
-              </div>
-            </div>
-            <div className="flex flex-col sm:flex-row gap-3">
-              <div className="relative flex-1">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-                <Input
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="Search by name, mobile, email, or ID..."
-                  className="h-9 pl-8 text-sm"
-                />
-              </div>
-              {canManageInstallationTeams ? (
-                <Button
-                  type="button"
-                  variant="secondary"
-                  className="h-9 shrink-0"
-                  onClick={() => setInstallationTeamsDialogOpen(true)}
-                >
-                  <Users className="w-4 h-4 mr-2" />
-                  Installation teams
-                </Button>
-              ) : null}
-            </div>
-          </CardContent>
-        </Card>
+          {canManageInstallationTeams ? (
+            <Button
+              type="button"
+              variant="secondary"
+              className="w-full sm:w-auto"
+              onClick={() => setInstallationTeamsDialogOpen(true)}
+            >
+              <Users className="w-4 h-4 mr-2" />
+              Installation teams
+            </Button>
+          ) : null}
+        </div>
+        {activeTab !== "done" ? (
+          <div className="mt-3 flex flex-wrap items-center gap-1.5">
+            <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground mr-1">
+              Overdue
+            </span>
+            {(
+              [
+                {
+                  key: "lt5" as const,
+                  label: "Less than 5",
+                  activeClass: "bg-emerald-600 text-white hover:bg-emerald-600 border-emerald-600",
+                },
+                {
+                  key: "gte5" as const,
+                  label: "5 equal and more",
+                  activeClass: "bg-amber-400 text-amber-950 hover:bg-amber-400 border-amber-400",
+                },
+                {
+                  key: "gte10" as const,
+                  label: "10 equal and more",
+                  activeClass: "bg-red-600 text-white hover:bg-red-600 border-red-600",
+                },
+              ] as const
+            ).map((chip) => (
+              <Button
+                key={chip.key}
+                type="button"
+                size="sm"
+                variant="outline"
+                className={cn("h-7 text-xs", filterInstallOverdue === chip.key && chip.activeClass)}
+                onClick={() => setFilterInstallOverdue((prev) => (prev === chip.key ? "all" : chip.key))}
+              >
+                {chip.label}
+              </Button>
+            ))}
+          </div>
+        ) : null}
 
         {canManageInstallationTeams ? (
           <InstallationTeamsDialog
@@ -1463,179 +1478,291 @@ export default function InstallerDashboardPage() {
           />
         ) : null}
 
-        <div className="space-y-3 pt-2">
-          {isLoading ? (
-            <Card>
-              <CardContent className="py-8 text-sm text-muted-foreground">Loading installation queue...</CardContent>
-            </Card>
-          ) : activeInstallationList.length === 0 ? (
-            <Card>
-              <CardContent className="py-8 text-sm text-muted-foreground text-center">
-                No installer records found
-              </CardContent>
-            </Card>
-          ) : (
-            activeInstallationList.map((q) => {
+        {isLoading ? (
+          <Card>
+            <CardContent className="py-12 text-sm text-muted-foreground text-center">
+              Loading installer records...
+            </CardContent>
+          </Card>
+        ) : activeInstallationList.length === 0 ? (
+          <Card>
+            <CardContent className="py-12 text-sm text-muted-foreground text-center">
+              No installer records found
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="native-scroll-list max-h-[min(70vh,820px)] overflow-y-auto overscroll-y-contain">
+            <div className="overflow-x-auto rounded-xl border border-border/70 bg-card shadow-sm">
+              <table className="w-full min-w-[78rem] border-collapse text-left">
+                <thead className="sticky top-0 z-10 bg-muted/80 backdrop-blur supports-[backdrop-filter]:bg-muted/70">
+                  <tr className="border-b border-border/70 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    <th className="px-3 py-2.5 whitespace-nowrap">Customer</th>
+                    <th className="px-3 py-2.5 whitespace-nowrap">Dealer</th>
+                    <th className="px-3 py-2.5 whitespace-nowrap">Sent</th>
+                    <th className="px-3 py-2.5 whitespace-nowrap">Install date</th>
+                    <th className="px-3 py-2.5 whitespace-nowrap">Team</th>
+                    <th className="px-3 py-2.5 whitespace-nowrap">Status</th>
+                    <th className="px-3 py-2.5 whitespace-nowrap text-right md:sticky md:right-0 md:bg-muted/90 md:z-10 md:shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.08)]">
+                      Actions
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeInstallationList.map((q) => {
               const installerStatus = getInstallerStatus(q)
               const qAny = q as Record<string, unknown>
               const dealer = getDealerDisplay(q)
               const sentToInstallationAt =
                 qAny.installationReleasedAt || qAny.installation_released_at || getAdminApprovedDate(q)
-              const sendToMetering = getSendToMeteringMenuState(q as Record<string, unknown>)
-              const photoThumbs = gatherInstallationPublicImageUrls(qAny, 24)
+              const installationListDate =
+                sentToInstallationAt ||
+                qAny.approvedAt ||
+                qAny.approvedDate ||
+                qAny.statusUpdatedAt ||
+                q.createdAt
+              const sentBaseStr = installationListDate ? String(installationListDate) : ""
+              const sentParsedOk = sentBaseStr ? !Number.isNaN(new Date(sentBaseStr).getTime()) : false
+              const defaultInstallYmd = sentParsedOk ? addCalendarDaysFromDateString(sentBaseStr, 7) : ""
+              const storedInstallYmd = toYmdFromStored(
+                (qAny.installationScheduledAt || qAny.installation_scheduled_at) as string | undefined,
+              )
+              const installationDateInputValue = storedInstallYmd || defaultInstallYmd
+              const overdueTone = installationOverdueTone(installationDateInputValue, installerStatus)
+              const overdueUi = overdueRowClasses(overdueTone)
+              const statusLabel = installerQueueStatusDisplayLabel(installerStatus)
+              const revertFromInstallation = getAdminInstallationTabRevertState(
+                q as Record<string, unknown>,
+                installerStatus,
+                readInstallerReleaseMap(),
+              )
+              const showExpanded = expandedQuotationId === q.id
 
               return (
-                <Card key={q.id} className="border-border/60 bg-gradient-to-r from-card to-muted/20 shadow-sm">
-                  <CardContent className="p-4">
-                    <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(200px,1fr)_130px_170px_150px_150px_auto] lg:items-center">
-                      <div className="min-w-0">
-                        <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Customer</p>
-                        <p className="text-sm font-semibold leading-tight">
+                <Fragment key={q.id}>
+                  <tr
+                    className={cn("border-b border-border/50 transition-colors", overdueUi.row)}
+                    title={overdueUi.title}
+                  >
+                    <td className="px-3 py-2.5 align-middle">
+                      <div className="min-w-[11rem] max-w-[14rem]">
+                        <p className="text-sm font-semibold leading-tight truncate">
                           {formatPersonName(q.customer?.firstName, q.customer?.lastName, "Unknown")}
                         </p>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          {q.customer?.mobile || "No mobile"} • {q.id}
+                        <p className="text-[11px] text-muted-foreground truncate">
+                          {q.customer?.mobile || "No mobile"}
                         </p>
-                        <div className="mt-2 border-t border-dashed border-border/60 pt-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-wide text-primary/90">Dealer</p>
-                          <p className="text-xs font-medium leading-snug text-foreground">{dealer.name}</p>
-                          <p className="text-[11px] text-muted-foreground">{dealer.mobile}</p>
-                        </div>
+                        <p className="text-[10px] font-medium text-muted-foreground/90 truncate">{q.id}</p>
                       </div>
-                      <div className="min-w-0">
-                        <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Sent to installation</p>
-                        <p className="text-xs font-medium flex items-center gap-1">
-                          <CalendarDays className="w-3 h-3 text-muted-foreground" />
-                          {sentToInstallationAt
-                            ? new Date(String(sentToInstallationAt)).toLocaleDateString("en-IN")
-                            : "N/A"}
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <div className="min-w-[8.5rem] max-w-[11rem]">
+                        <p className="text-xs font-medium leading-tight truncate text-primary" title={dealer.name}>
+                          {dealer.name}
                         </p>
+                        <p className="text-[11px] text-muted-foreground truncate">{dealer.mobile}</p>
                       </div>
-                      <div className="min-w-0">
-                        <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Installation date</p>
-                        <p className="text-xs font-medium flex items-center gap-1 mt-0.5">
-                          <CalendarDays className="w-3 h-3 text-muted-foreground" />
-                          {getInstallationDateLabel(q)}
-                        </p>
-                      </div>
-                      <div className="min-w-0">
-                        {canManageInstallationTeams ? (
-                          <>
-                            <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Team</Label>
-                            <Select
-                              key={`inst-team-${q.id}-${installationTeamsRefresh}`}
-                              value={getInstallationTeamIdForQuotation(q.id, q as Record<string, unknown>) || "__none__"}
-                              onValueChange={(v) =>
-                                void handlePersistInstallationTeamAssignment(q.id, v === "__none__" ? "" : v)
+                    </td>
+                    <td className="px-3 py-2.5 align-middle whitespace-nowrap">
+                      <p className="text-xs font-medium inline-flex items-center gap-1">
+                        <Calendar className="w-3 h-3 text-muted-foreground shrink-0" />
+                        {installationListDate
+                          ? new Date(installationListDate as string).toLocaleDateString("en-IN")
+                          : "N/A"}
+                      </p>
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <div className="min-w-[9.5rem]">
+                        <Input
+                          id={`install-date-${q.id}`}
+                          type="date"
+                          className="h-8 text-xs w-[9.5rem]"
+                          value={installationDateInputValue}
+                          disabled={!sentParsedOk || installationReadOnly}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            const id = q.id
+                            setQuotations((prev) =>
+                              prev.map((row) =>
+                                row.id === id ? { ...row, installationScheduledAt: v || undefined } : row,
+                              ),
+                            )
+                            setInstallationScheduledDateInLocalMap(id, v || undefined)
+                            void (async () => {
+                              if (!useApi) return
+                              try {
+                                await api.admin.quotations.updateInstallationScheduledDate(id, v || null)
+                              } catch {
+                                // local map already updated
                               }
-                            >
-                              <SelectTrigger className="h-8 text-xs mt-0.5">
-                                <SelectValue placeholder="Unassigned" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="__none__">Unassigned</SelectItem>
-                                {installationTeams.map((t) => (
-                                  <SelectItem key={t.id} value={t.id}>
-                                    {t.name}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </>
-                        ) : (
-                          <>
-                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Team</p>
-                            <p className="text-xs font-medium mt-0.5">{getTeamDisplayName(q)}</p>
-                          </>
-                        )}
+                            })()
+                          }}
+                        />
+                        {!sentParsedOk ? (
+                          <p className="text-[10px] text-muted-foreground mt-0.5">Set release first</p>
+                        ) : null}
                       </div>
-                      <div className="min-w-0">
-                        <Badge
-                          variant="outline"
-                          className={
-                            installerStatus === "approved"
-                              ? "text-xs font-medium border-green-300/80 bg-green-50 text-green-800"
-                              : installerStatus === "partial"
-                                ? "text-xs font-medium border-violet-300/80 bg-violet-50 text-violet-800"
-                                : installerStatus === "inprogress"
-                                  ? "text-xs font-medium border-sky-300/80 bg-sky-50 text-sky-800"
-                                  : "text-xs font-medium border-amber-300/80 bg-amber-50 text-amber-800"
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      {canManageInstallationTeams ? (
+                        <Select
+                          key={`inst-team-${q.id}-${installationTeamsRefresh}`}
+                          value={getInstallationTeamIdForQuotation(q.id, qAny) || "__none__"}
+                          onValueChange={(v) =>
+                            void handlePersistInstallationTeamAssignment(q.id, v === "__none__" ? "" : v)
                           }
+                          disabled={installationReadOnly}
                         >
-                          {installerStatus === "approved"
-                            ? "Approved"
-                            : installerStatus === "partial"
-                              ? "Partial Approved"
-                              : installerStatus === "inprogress"
-                                ? "In Progress"
-                                : "Pending"}
-                        </Badge>
-                      </div>
-                      <div className="flex flex-wrap items-center justify-start gap-2 lg:ml-auto lg:justify-end">
+                          <SelectTrigger className="h-8 text-xs w-[9.5rem]">
+                            <SelectValue placeholder="Unassigned" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__">Unassigned</SelectItem>
+                            {installationTeams.map((t) => (
+                              <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <p className="text-xs font-medium">{getTeamDisplayName(q)}</p>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <Badge
+                        variant="outline"
+                        className={cn("text-[10px] capitalize font-medium", installerStageBadgeTone(installerStatus))}
+                      >
+                        {statusLabel}
+                      </Badge>
+                    </td>
+                    <td
+                      className={cn(
+                        "px-3 py-2.5 align-middle text-right md:sticky md:right-0 md:z-10 md:shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.08)]",
+                        overdueUi.sticky,
+                      )}
+                    >
+                      <div className="flex flex-nowrap items-center justify-end gap-1.5">
                         {installerStatus === "pending" ? (
                           <>
-                            <Button variant="outline" size="sm" onClick={() => setInProgress(q)}>
-                              <Clock3 className="w-3.5 h-3.5 mr-1" />
-                              Start In Progress
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-8 w-8 shrink-0 p-0"
+                              title="Start"
+                              disabled={installationReadOnly}
+                              onClick={() => startInstallationInProgress(q)}
+                            >
+                              <Clock3 className="w-3.5 h-3.5" />
+                              <span className="sr-only">Start</span>
                             </Button>
-                            <Button size="sm" onClick={() => openUploadPanel(q)}>
-                              <ChevronDown className="w-3.5 h-3.5 mr-1" />
-                              Upload
+                            <Button
+                              size="sm"
+                              className="h-8 w-8 shrink-0 p-0"
+                              title="Upload"
+                              disabled={installationReadOnly}
+                              onClick={() => openUploadPanel(q)}
+                            >
+                              <ChevronDown className="w-3.5 h-3.5" />
+                              <span className="sr-only">Upload</span>
                             </Button>
                           </>
                         ) : null}
                         {installerStatus === "inprogress" || installerStatus === "partial" ? (
-                          <Button size="sm" onClick={() => openUploadPanel(q)}>
-                            <ChevronDown className="w-3.5 h-3.5 mr-1" />
-                            Upload
+                          <Button
+                            size="sm"
+                            className="h-8 w-8 shrink-0 p-0"
+                            title={installerStatus === "partial" ? "Continue" : "Upload"}
+                            disabled={installationReadOnly}
+                            onClick={() => openUploadPanel(q)}
+                          >
+                            <ChevronDown className="w-3.5 h-3.5" />
+                            <span className="sr-only">{installerStatus === "partial" ? "Continue" : "Upload"}</span>
+                          </Button>
+                        ) : null}
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 w-8 shrink-0 p-0"
+                          title="Timeline"
+                          onClick={() => setStatusHistoryQuotation(q)}
+                        >
+                          <History className="w-3.5 h-3.5" />
+                          <span className="sr-only">Timeline</span>
+                        </Button>
+                        {installerStatus !== "approved" ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className={cn(
+                              "h-8 w-8 shrink-0 p-0 border-amber-800/40 text-amber-950 dark:text-amber-100",
+                              !revertFromInstallation.enabled || retrievingFromInstallationId === q.id
+                                ? "opacity-60"
+                                : "",
+                            )}
+                            title={revertFromInstallation.hint || "Revert to Accounts"}
+                            disabled={
+                              installationReadOnly ||
+                              !revertFromInstallation.enabled ||
+                              retrievingFromInstallationId === q.id
+                            }
+                            onClick={() => void handleRetrieveFromInstallation(q)}
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span className="sr-only">Revert</span>
+                          </Button>
+                        ) : null}
+                        {installerStatus === "approved" || installerStatus === "partial" ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-8 w-8 shrink-0 p-0"
+                            title="View uploaded installation photos"
+                            onClick={() => openInstallPhotosViewer(q)}
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span className="sr-only">View photos</span>
                           </Button>
                         ) : null}
                         {installerStatus === "approved" ? (
                           <>
-                            {sendToMetering.visible ? (
-                              <Button
-                                type="button"
-                                size="sm"
-                                onClick={() => void handleSendToMetering(q)}
-                                disabled={sendingToMeteringId === q.id}
-                                className={!sendToMetering.enabled ? "opacity-60" : ""}
-                                title={sendToMetering.hint || "Send to metering team"}
-                              >
-                                <Gauge className="w-3.5 h-3.5 mr-1" />
-                                {sendingToMeteringId === q.id ? "Sending..." : "Send to Metering"}
-                              </Button>
-                            ) : null}
-                            <Button type="button" size="sm" variant="secondary" onClick={() => openUploadPanel(q)}>
-                              <Edit className="w-3.5 h-3.5 mr-1" />
-                              Edit photos
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              className="h-8 w-8 shrink-0 p-0"
+                              title="Edit"
+                              disabled={installationReadOnly}
+                              onClick={() => openUploadPanel(q)}
+                            >
+                              <Edit className="w-3.5 h-3.5" />
+                              <span className="sr-only">Edit</span>
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-8 w-8 shrink-0 p-0 border-amber-800/40 text-amber-950 dark:text-amber-100"
+                              title="Revert"
+                              disabled={installationReadOnly}
+                              onClick={() =>
+                                setInstallRevertTarget({
+                                  id: q.id,
+                                  label: formatPersonName(q.customer?.firstName, q.customer?.lastName, q.id),
+                                })
+                              }
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span className="sr-only">Revert</span>
                             </Button>
                           </>
                         ) : null}
                       </div>
-                    </div>
-
-                    {installerStatus === "approved" ? (
-                      <div className="mt-3 space-y-2 border-t border-border/60 pt-3">
-                        <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                          Uploaded installation photos
-                        </p>
-                        {photoThumbs.length === 0 ? (
-                          <p className="text-[11px] text-muted-foreground">
-                            No photos on file yet. Use <span className="font-medium">Edit photos</span> to add or replace
-                            images.
-                          </p>
-                        ) : (
-                          <div className="flex max-w-full gap-3 overflow-x-auto pb-1">
-                            {photoThumbs.map((url, idx) => (
-                              <InstallationPublicPhoto key={`${q.id}-inst-${idx}`} rawUrl={url} quotationId={q.id} />
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    ) : null}
-
-                    {expandedQuotationId === q.id ? (
-                      <div className="mt-4">
+                    </td>
+                  </tr>
+                  {showExpanded ? (
+                    <tr className="border-b border-border/50 bg-muted/15">
+                      <td colSpan={7} className="px-3 py-4">
                         <InstallationCompletionPanel
                           loadingText={loadingDetailsForId === q.id ? "Loading full customer/quotation details..." : undefined}
                           imageFields={INSTALLATION_IMAGE_FIELDS}
@@ -1728,20 +1855,77 @@ export default function InstallerDashboardPage() {
                             installerStatus === "approved" ? undefined : "Partial Approved"
                           }
                           saving={savingId === q.id}
+                          readOnly={installationReadOnly}
                           onCancel={() => setExpandedQuotationId(null)}
                           onSave={() => void handleApproveInstallation(q, "full")}
                           onSecondarySave={() => void handleApproveInstallation(q, "partial")}
                         />
-                      </div>
-                    ) : null}
-                  </CardContent>
-                </Card>
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
               )
-            })
-          )}
-        </div>
-        </>
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
         )}
+        <InstallationStatusTimelineDialog
+          open={!!statusHistoryQuotation}
+          onOpenChange={(open) => !open && setStatusHistoryQuotation(null)}
+          quotationId={statusHistoryQuotation?.id}
+          createdAt={statusHistoryQuotation?.createdAt}
+          fileLoginAt={(statusHistoryQuotation as Record<string, unknown>)?.fileLoginAt as string | undefined}
+          statusApprovedAt={(statusHistoryQuotation as Record<string, unknown>)?.statusApprovedAt as string | undefined}
+          status={statusHistoryQuotation?.status}
+          statusHistory={(statusHistoryQuotation as Record<string, unknown>)?.statusHistory as import("@/lib/quotation-context").StatusHistoryEntry[] | undefined}
+        />
+        <InstallationPhotosViewerDialog
+          open={!!installPhotosViewer}
+          onOpenChange={(open) => {
+            if (!open) {
+              setInstallPhotosViewer(null)
+              setInstallPhotoUrls([])
+              setInstallPhotosLoading(false)
+            }
+          }}
+          quotationId={installPhotosViewer?.id}
+          title={
+            installPhotosViewer
+              ? `${formatPersonName(
+                  installPhotosViewer.customer?.firstName,
+                  installPhotosViewer.customer?.lastName,
+                  "Customer",
+                )} · ${installPhotosViewer.id}`
+              : undefined
+          }
+          photoUrls={installPhotoUrls}
+          loading={installPhotosLoading}
+        />
+        <Dialog open={!!installRevertTarget} onOpenChange={(open) => !open && setInstallRevertTarget(null)}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Revert to pending installation?</DialogTitle>
+              <DialogDescription>
+                {installRevertTarget ? (
+                  <>
+                    <span className="font-medium text-foreground">{installRevertTarget.label}</span> will move back to{" "}
+                    <strong>Pending Installation</strong>.
+                  </>
+                ) : null}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button type="button" variant="outline" onClick={() => setInstallRevertTarget(null)} disabled={installRevertSaving}>
+                Cancel
+              </Button>
+              <Button type="button" variant="default" onClick={() => void confirmRevertInstallationToPending()} disabled={installRevertSaving}>
+                {installRevertSaving ? "Reverting…" : "Yes, revert"}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
       </main>
     </div>
   )

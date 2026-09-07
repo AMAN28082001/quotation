@@ -43,6 +43,7 @@ import {
 } from "@/lib/calling-action-summary"
 import { filterActiveDealers } from "@/lib/active-dealers"
 import { listAssignableQuotationFromDirectory } from "@/lib/quotation-assignable-directory"
+import { HrSocialMediaSheetsPanel } from "@/components/hr-social-media-sheets-panel"
 
 type DealerOption = {
   id: string
@@ -1549,10 +1550,19 @@ export default function HrDashboardPage() {
         </p>
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
-          <TabsList className="flex w-full justify-start overflow-x-auto whitespace-nowrap">
-            <TabsTrigger value="assignment" className="shrink-0 text-xs sm:text-sm">Assignment</TabsTrigger>
-            <TabsTrigger value="uploaded-data" className="shrink-0 text-xs sm:text-sm">Uploaded Data</TabsTrigger>
-            <TabsTrigger value="dealer-actions" className="shrink-0 text-xs sm:text-sm">Dealer Actions</TabsTrigger>
+          <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4 h-auto gap-1 p-1">
+            <TabsTrigger value="assignment" className="text-xs sm:text-sm">
+              Assignment
+            </TabsTrigger>
+            <TabsTrigger value="social-media" className="text-xs sm:text-sm">
+              Social Media
+            </TabsTrigger>
+            <TabsTrigger value="uploaded-data" className="text-xs sm:text-sm">
+              Uploaded Data
+            </TabsTrigger>
+            <TabsTrigger value="dealer-actions" className="text-xs sm:text-sm">
+              Dealer Actions
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="assignment" className="space-y-4">
@@ -1629,6 +1639,14 @@ export default function HrDashboardPage() {
                 </div>
               </CardContent>
             </Card>
+          </TabsContent>
+
+          <TabsContent value="social-media" className="space-y-4">
+            <HrSocialMediaSheetsPanel
+              dealers={quotationDealers}
+              realtimeTick={realtimeTick}
+              onSyncComplete={() => setRealtimeTick((t) => t + 1)}
+            />
           </TabsContent>
 
           <TabsContent value="uploaded-data">

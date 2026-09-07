@@ -56,6 +56,18 @@ function shouldQuietApiLog(
   return isApiAuthFailure(status, errorCode, errorMessage)
 }
 
+/** Continue to the next list-route fallback (403/404/etc.) without treating as fatal. */
+function isRetryableListEndpointError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false
+  return (
+    error.code === "HTTP_403" ||
+    error.code === "HTTP_404" ||
+    error.code === "HTTP_405" ||
+    error.code === "HTTP_501" ||
+    error.code === "AUTH_004"
+  )
+}
+
 class ApiError extends Error {
   code: string
   details?: Array<{ field: string; message: string }>
@@ -724,6 +736,76 @@ export async function sendQuotationToMetering(quotationId: string): Promise<bool
   return stepped
 }
 
+/**
+ * Admin: pull quotation back from Metering (Meter Pending) to installer_approved
+ * so it can be sent again from Quotations / Installation.
+ */
+export async function retrieveQuotationFromMetering(quotationId: string): Promise<boolean> {
+  const target = "installer_approved"
+  const body = {
+    ...operationalWorkflowBody(target),
+    target,
+    retrieveFromMetering: true,
+    allowRevert: true,
+  }
+  const endpoints = [
+    `/admin/quotations/${quotationId}/retrieve-from-metering`,
+    `/admin/quotations/${quotationId}/metering-handoff`,
+    `/installer/quotations/${quotationId}/retrieve-from-metering`,
+  ]
+  for (const endpoint of endpoints) {
+    if (await trySilentApiStep(() => apiRequest(endpoint, { method: "PATCH", body }))) {
+      return true
+    }
+    if (await trySilentApiStep(() => apiRequest(endpoint, { method: "POST", body }))) {
+      return true
+    }
+  }
+  return patchOperationalWorkflowStatus(quotationId, target)
+}
+
+/**
+ * Admin / Accounts: undo Send to Installer — clear release flags so row leaves Installation tab.
+ */
+export async function retrieveQuotationFromInstallation(quotationId: string): Promise<boolean> {
+  const body = {
+    installationReadyForInstaller: false,
+    installation_ready_for_installer: false,
+    installationReleasedAt: null,
+    installation_released_at: null,
+    retrieveFromInstallation: true,
+    allowRevert: true,
+    source: "retrieve-from-installation",
+  }
+  const endpoints = [
+    `/admin/quotations/${quotationId}/retrieve-from-installation`,
+    `/quotations/${quotationId}/retrieve-from-installation`,
+    `/quotations/${quotationId}/installation-release`,
+    `/admin/quotations/${quotationId}/installation-release`,
+  ]
+  for (const endpoint of endpoints) {
+    if (await trySilentApiStep(() => apiRequest(endpoint, { method: "PATCH", body }))) {
+      return true
+    }
+    if (await trySilentApiStep(() => apiRequest(endpoint, { method: "POST", body }))) {
+      return true
+    }
+  }
+  try {
+    await apiRequest(`/quotations/${quotationId}/installation-release`, {
+      method: "PATCH",
+      body: {
+        ...body,
+        installationStatus: "",
+        installation_status: "",
+      },
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Try every admin/metering path to reach MCO; returns true if any call succeeded. */
 export async function forceAdvanceQuotationToMco(quotationId: string): Promise<boolean> {
   let ok = false
@@ -1066,9 +1148,11 @@ export const api = {
         ]
 
         let lastError: unknown = null
-        for (const endpoint of endpoints) {
+        for (let i = 0; i < endpoints.length; i++) {
           try {
-            return await apiRequest(endpoint)
+            return await apiRequest(endpoints[i], {
+              suppressErrorLog: true,
+            })
           } catch (error) {
             lastError = error
             const isMissingOrForbidden =
@@ -1157,15 +1241,43 @@ export const api = {
       })
     },
 
-    getAll: async (params?: {
+    getAll: async (
+      params?: {
+        page?: number
+        limit?: number
+        status?: string
+        search?: string
+        startDate?: string
+        endDate?: string
+        sortBy?: string
+        sortOrder?: "asc" | "desc"
+      },
+      options?: { suppressErrorLog?: boolean },
+    ) => {
+      const queryParams = new URLSearchParams()
+      if (params) {
+        Object.entries(params).forEach(([key, value]) => {
+          if (value !== undefined) queryParams.append(key, String(value))
+        })
+      }
+      const query = queryParams.toString()
+      return apiRequest(`/quotations${query ? `?${query}` : ""}`, {
+        suppressErrorLog: options?.suppressErrorLog,
+      })
+    },
+
+    /**
+     * Full quotation list for workflow dashboards (Installation / Metering / Final confirmation)
+     * when module scope is Everyone. Tries admin and module routes before dealer-scoped /quotations.
+     * Expected 403s are quiet and fall through to the next route.
+     */
+    getWorkflowDashboardList: async (params?: {
       page?: number
       limit?: number
       status?: string
       search?: string
       startDate?: string
       endDate?: string
-      sortBy?: string
-      sortOrder?: "asc" | "desc"
     }) => {
       const queryParams = new URLSearchParams()
       if (params) {
@@ -1174,11 +1286,65 @@ export const api = {
         })
       }
       const query = queryParams.toString()
-      return apiRequest(`/quotations${query ? `?${query}` : ""}`)
+      const suffix = query ? `?${query}` : ""
+      const endpoints = [
+        `/admin/quotations${suffix}`,
+        `/account-management/quotations${suffix}`,
+        `/installer/quotations${suffix}`,
+        `/quotations${suffix}`,
+      ]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint, { suppressErrorLog: true })
+        } catch (error) {
+          lastError = error
+          if (!isRetryableListEndpointError(error)) throw error
+        }
+      }
+      throw lastError
     },
 
-    getById: async (quotationId: string) => {
-      return apiRequest(`/quotations/${quotationId}`)
+    /**
+     * Approved quotations for Accounts dashboard when scope is Everyone.
+     * Tries account-management + admin routes before dealer-scoped /quotations.
+     */
+    getApprovedForAccounts: async (params?: {
+      page?: number
+      limit?: number
+      status?: string
+      search?: string
+      startDate?: string
+      endDate?: string
+    }) => {
+      const queryParams = new URLSearchParams()
+      if (params) {
+        Object.entries(params).forEach(([key, value]) => {
+          if (value !== undefined) queryParams.append(key, String(value))
+        })
+      }
+      const query = queryParams.toString()
+      const suffix = query ? `?${query}` : ""
+      const endpoints = [
+        `/account-management/quotations${suffix}`,
+        `/admin/quotations${suffix}`,
+      ]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint, { suppressErrorLog: true })
+        } catch (error) {
+          lastError = error
+          if (!isRetryableListEndpointError(error)) throw error
+        }
+      }
+      return apiRequest(`/quotations${suffix}`, { suppressErrorLog: true })
+    },
+
+    getById: async (quotationId: string, options?: { suppressErrorLog?: boolean }) => {
+      return apiRequest(`/quotations/${quotationId}`, {
+        suppressErrorLog: options?.suppressErrorLog,
+      })
     },
 
     /**
@@ -2782,14 +2948,17 @@ export const api = {
   // Installer APIs
   installer: {
     /** Fetch installer queue with endpoint fallbacks for live backend variations. */
-    getQueue: async (params?: {
-      page?: number
-      limit?: number
-      status?: string
-      search?: string
-      sortBy?: string
-      sortOrder?: "asc" | "desc"
-    }) => {
+    getQueue: async (
+      params?: {
+        page?: number
+        limit?: number
+        status?: string
+        search?: string
+        sortBy?: string
+        sortOrder?: "asc" | "desc"
+      },
+      options?: { suppressErrorLog?: boolean },
+    ) => {
       const queryParams = new URLSearchParams()
       if (params) {
         Object.entries(params).forEach(([key, value]) => {
@@ -2805,15 +2974,16 @@ export const api = {
       ]
 
       let lastError: unknown = null
-      for (const endpoint of endpoints) {
+      for (let i = 0; i < endpoints.length; i++) {
+        const endpoint = endpoints[i]
+        const isLast = i === endpoints.length - 1
         try {
-          return await apiRequest(endpoint)
+          return await apiRequest(endpoint, {
+            suppressErrorLog: options?.suppressErrorLog ?? !isLast,
+          })
         } catch (error) {
           lastError = error
-          const retryable =
-            error instanceof ApiError &&
-            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
-          if (!retryable) throw error
+          if (!isRetryableListEndpointError(error)) throw error
         }
       }
       throw lastError
@@ -3408,9 +3578,11 @@ export const api = {
         ]
 
         let lastError: unknown = null
-        for (const endpoint of endpoints) {
+        for (let i = 0; i < endpoints.length; i++) {
           try {
-            return await apiRequest(endpoint)
+            return await apiRequest(endpoints[i], {
+              suppressErrorLog: true,
+            })
           } catch (error) {
             lastError = error
             const isMissingEndpoint =
@@ -3690,6 +3862,140 @@ export const api = {
             "HTTP_404",
           )
     },
+
+    sheetSources: {
+    getAll: async () => {
+      const endpoints = ["/hr/sheet-sources", "/hr/social-sheet-sources", "/hr/google-sheet-sources"]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint)
+        } catch (error) {
+          lastError = error
+          const missing =
+            error instanceof ApiError &&
+            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
+          if (!missing) throw error
+        }
+      }
+      throw lastError
+    },
+
+    discover: async (spreadsheetId: string) => {
+      const body = { spreadsheetId, spreadsheet_id: spreadsheetId }
+      const endpoints = ["/hr/sheet-sources/discover", "/hr/social-sheet-sources/discover"]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint, { method: "POST", body })
+        } catch (error) {
+          lastError = error
+          const missing =
+            error instanceof ApiError &&
+            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
+          if (!missing) throw error
+        }
+      }
+      throw lastError
+    },
+
+    update: async (
+      sourceId: string,
+      patch: {
+        enabled?: boolean
+        dealerIds?: string[]
+        activeLimitPerDealer?: number
+        displayName?: string
+      },
+    ) => {
+      const id = encodeURIComponent(sourceId)
+      const body = {
+        ...patch,
+        dealer_ids: patch.dealerIds,
+        active_limit_per_dealer: patch.activeLimitPerDealer,
+        display_name: patch.displayName,
+      }
+      const endpoints = [`/hr/sheet-sources/${id}`, `/hr/social-sheet-sources/${id}`]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint, { method: "PATCH", body })
+        } catch (error) {
+          lastError = error
+          const missing =
+            error instanceof ApiError &&
+            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
+          if (!missing) throw error
+        }
+      }
+      throw lastError
+    },
+
+    sync: async (sourceId: string) => {
+      const id = encodeURIComponent(sourceId)
+      const endpoints = [`/hr/sheet-sources/${id}/sync`, `/hr/social-sheet-sources/${id}/sync`]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint, { method: "POST", body: {} })
+        } catch (error) {
+          lastError = error
+          const missing =
+            error instanceof ApiError &&
+            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
+          if (!missing) throw error
+        }
+      }
+      throw lastError
+    },
+
+    /** Backend cron target — sync every enabled sheet tab (every ~15 min). */
+    syncAll: async (spreadsheetId?: string) => {
+      const body = spreadsheetId
+        ? { spreadsheetId, spreadsheet_id: spreadsheetId }
+        : {}
+      const endpoints = ["/hr/sheet-sources/sync-all", "/hr/social-sheet-sources/sync-all"]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint, { method: "POST", body })
+        } catch (error) {
+          lastError = error
+          const missing =
+            error instanceof ApiError &&
+            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
+          if (!missing) throw error
+        }
+      }
+      throw lastError
+    },
+
+    getLeads: async (sourceId: string, params?: { page?: number; limit?: number }) => {
+      const id = encodeURIComponent(sourceId)
+      const queryParams = new URLSearchParams()
+      if (params?.page) queryParams.set("page", String(params.page))
+      if (params?.limit) queryParams.set("limit", String(params.limit))
+      const q = queryParams.toString()
+      const suffix = q ? `?${q}` : ""
+      const endpoints = [
+        `/hr/sheet-sources/${id}/leads${suffix}`,
+        `/hr/social-sheet-sources/${id}/leads${suffix}`,
+      ]
+      let lastError: unknown = null
+      for (const endpoint of endpoints) {
+        try {
+          return await apiRequest(endpoint)
+        } catch (error) {
+          lastError = error
+          const missing =
+            error instanceof ApiError &&
+            (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
+          if (!missing) throw error
+        }
+      }
+      throw lastError
+    },
+  },
   },
 
   // Admin APIs
@@ -3702,6 +4008,8 @@ export const api = {
         search?: string
         startDate?: string
         endDate?: string
+        fromDate?: string
+        toDate?: string
         range?: "daily" | "weekly" | "monthly" | "last_month" | "all" | "custom"
       }) => {
         const queryParams = new URLSearchParams()
@@ -3720,15 +4028,21 @@ export const api = {
         ]
 
         let lastError: unknown = null
-        for (const endpoint of endpoints) {
+        for (let i = 0; i < endpoints.length; i++) {
           try {
-            return await apiRequest(endpoint)
+            return await apiRequest(endpoints[i], {
+              suppressErrorLog: true,
+            })
           } catch (error) {
             lastError = error
-            const isMissingEndpoint =
+            const isMissingOrForbidden =
               error instanceof ApiError &&
-              (error.code === "HTTP_404" || error.code === "HTTP_405" || error.code === "HTTP_501")
-            if (!isMissingEndpoint) throw error
+              (error.code === "HTTP_404" ||
+                error.code === "HTTP_405" ||
+                error.code === "HTTP_501" ||
+                error.code === "HTTP_403" ||
+                error.code === "AUTH_004")
+            if (!isMissingOrForbidden) throw error
           }
         }
 
@@ -3737,15 +4051,18 @@ export const api = {
     },
 
     quotations: {
-      getAll: async (params?: {
-        page?: number
-        limit?: number
-        status?: string
-        search?: string
-        startDate?: string
-        endDate?: string
-        dealerId?: string
-      }) => {
+      getAll: async (
+        params?: {
+          page?: number
+          limit?: number
+          status?: string
+          search?: string
+          startDate?: string
+          endDate?: string
+          dealerId?: string
+        },
+        options?: { suppressErrorLog?: boolean },
+      ) => {
         const queryParams = new URLSearchParams()
         if (params) {
           Object.entries(params).forEach(([key, value]) => {
@@ -3753,7 +4070,9 @@ export const api = {
           })
         }
         const query = queryParams.toString()
-        return apiRequest(`/admin/quotations${query ? `?${query}` : ""}`)
+        return apiRequest(`/admin/quotations${query ? `?${query}` : ""}`, {
+          suppressErrorLog: options?.suppressErrorLog,
+        })
       },
 
       /** Full quotation row (products / quotationProduct join). Tries admin route first. */
@@ -3859,6 +4178,52 @@ export const api = {
                 /cannot send to metering/i.test(error.message) ||
                 /pending_installer/i.test(error.message) ||
                 /not allowed for this quotation state/i.test(error.message))
+            if (!isRetryable) throw error
+          }
+        }
+        throw lastError
+      },
+
+      /**
+       * Move an approved install back to Pending Installation.
+       * Does not PATCH quotation `status` (that enum is pending/approved, not workflow stages).
+       */
+      revertInstallationToPending: async (quotationId: string) => {
+        const body = {
+          installationStatus: "pending_installer",
+          installation_status: "pending_installer",
+          force: true,
+          adminOverride: true,
+          allowRevert: true,
+          source: "admin-install-revert",
+          installerApprovedAt: null,
+          installer_approved_at: null,
+          installationPartialApproved: false,
+          installation_partial_approved: false,
+        }
+        const endpoints: Array<{ endpoint: string; method: "PATCH" | "POST" }> = [
+          { endpoint: `/admin/quotations/${quotationId}/installation-status`, method: "PATCH" },
+          { endpoint: `/admin/quotations/${quotationId}/workflow-status`, method: "PATCH" },
+          { endpoint: `/installer/quotations/${quotationId}/installation-status`, method: "PATCH" },
+          { endpoint: `/admin/quotations/${quotationId}/revert-installation`, method: "POST" },
+          { endpoint: `/quotations/${quotationId}`, method: "PATCH" },
+        ]
+        let lastError: unknown = null
+        for (const attempt of endpoints) {
+          try {
+            return await apiRequest(attempt.endpoint, { method: attempt.method, body })
+          } catch (error) {
+            lastError = error
+            const isRetryable =
+              error instanceof ApiError &&
+              (error.code === "HTTP_404" ||
+                error.code === "HTTP_405" ||
+                error.code === "HTTP_501" ||
+                error.code === "HTTP_403" ||
+                error.code === "AUTH_004" ||
+                /not allowed/i.test(error.message) ||
+                /cannot/i.test(error.message) ||
+                /invalid status/i.test(error.message))
             if (!isRetryable) throw error
           }
         }

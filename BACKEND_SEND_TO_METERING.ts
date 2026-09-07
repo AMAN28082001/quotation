@@ -269,4 +269,8 @@ router.patch("/admin/quotations/:id/installation-status", authRequired, patchAdm
  5. Admin → Metering tab → Meter Pending shows the row.
  6. Metering role login → Meter Pending shows the same row.
  7. Console: [SendToMetering] ▶ IN / ① BEFORE / ② AFTER / ◀ OUT 200.
+
+Related:
+  - Retrieve from Metering → BACKEND_RETRIEVE_FROM_METERING.ts (HANDOFF §39)
+  - Retrieve from Installation → BACKEND_RETRIEVE_FROM_INSTALLATION.ts (HANDOFF §40)
 */

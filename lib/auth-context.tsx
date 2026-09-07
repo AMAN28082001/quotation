@@ -20,6 +20,12 @@ import {
   resolveUserAccess,
   writeSessionAccess,
 } from "./user-access"
+import {
+  resolveUserModulePermissions,
+  resolveUserOfficeLocation,
+  type ModuleFieldPermissions,
+  type OfficeLocation,
+} from "./module-field-permissions"
 
 // asd
 
@@ -48,6 +54,10 @@ export interface Dealer {
   /** Admin dashboard access checkboxes (when API / edit provides them). */
   access?: UserAccessKey[]
   permissions?: UserAccessKey[]
+  officeLocation?: OfficeLocation | string
+  office_location?: string
+  moduleFieldPermissions?: ModuleFieldPermissions
+  modulePermissions?: ModuleFieldPermissions
 }
 
 export interface Visitor {
@@ -65,6 +75,10 @@ export interface Visitor {
   updatedAt?: string
   access?: UserAccessKey[]
   permissions?: UserAccessKey[]
+  officeLocation?: OfficeLocation | string
+  office_location?: string
+  moduleFieldPermissions?: ModuleFieldPermissions
+  modulePermissions?: ModuleFieldPermissions
 }
 
 export interface AccountManager {
@@ -80,6 +94,10 @@ export interface AccountManager {
   role?: string
   access?: UserAccessKey[]
   permissions?: UserAccessKey[]
+  officeLocation?: OfficeLocation | string
+  office_location?: string
+  moduleFieldPermissions?: ModuleFieldPermissions
+  modulePermissions?: ModuleFieldPermissions
 }
 
 export interface InstallerUser {
@@ -161,6 +179,9 @@ interface AuthContextType {
   role: UserRole | null
   /** Dashboard sections granted by Admin (checkboxes). */
   access: UserAccessKey[]
+  /** Installation / Metering read vs write (separate from dashboard access). */
+  modulePermissions: ModuleFieldPermissions
+  officeLocation: OfficeLocation | ""
   isAuthenticated: boolean
   /** False until localStorage session has been read (avoids refresh redirect races). */
   authReady: boolean
@@ -188,6 +209,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [hrUser, setHrUser] = useState<HrUser | null>(null)
   const [role, setRole] = useState<UserRole | null>(null)
   const [access, setAccess] = useState<UserAccessKey[]>([])
+  const [modulePermissions, setModulePermissions] = useState<ModuleFieldPermissions>({})
+  const [officeLocation, setOfficeLocation] = useState<OfficeLocation | "">("")
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [authReady, setAuthReady] = useState(false)
 
@@ -251,6 +274,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     })
     writeSessionAccess(granted)
     setAccess(granted)
+    const perms = resolveUserModulePermissions(
+      username,
+      user?.moduleFieldPermissions ?? user?.modulePermissions,
+    )
+    const office = resolveUserOfficeLocation(username, user?.officeLocation ?? user?.office_location)
+    setModulePermissions(perms)
+    setOfficeLocation(office)
     return granted
   }
 
@@ -295,6 +325,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           writeSessionAccess(sessionAccess)
           setAccess(sessionAccess)
         }
+        const perms = resolveUserModulePermissions(
+          user.username,
+          user.moduleFieldPermissions ?? user.modulePermissions,
+        )
+        const office = resolveUserOfficeLocation(user.username, user.officeLocation ?? user.office_location)
+        setModulePermissions(perms)
+        setOfficeLocation(office)
         setInstallationTeamUser(null)
         if (sessionAccess.length > 1) {
           applyAccessProfiles(user, sessionAccess)
@@ -730,6 +767,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setHrUser(null)
     setRole(null)
     setAccess([])
+    setModulePermissions({})
+    setOfficeLocation("")
 
     localStorage.removeItem("authToken")
     localStorage.removeItem("refreshToken")
@@ -1216,6 +1255,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setInstaller(null)
         setMeteringUser(null)
         setHrUser(null)
+        commitSessionAccess(user.username, backendRole, user)
         setRole("baldev")
         setIsAuthenticated(true)
 
@@ -1254,6 +1294,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setInstaller(null)
     setMeteringUser(null)
     setHrUser(null)
+    commitSessionAccess(foundBaldev.username, "baldev", foundBaldev)
     setRole("baldev")
     setIsAuthenticated(true)
     localStorage.setItem("baldevUser", JSON.stringify(baldevData))
@@ -1422,6 +1463,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         hrUser,
         role,
         access,
+        modulePermissions,
+        officeLocation,
         isAuthenticated,
         authReady,
         login,

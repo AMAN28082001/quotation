@@ -8,10 +8,7 @@ import { FullCustomerJourneyPanel } from "@/components/full-customer-journey-pan
 import { api, ApiError } from "@/lib/api"
 import type { Quotation } from "@/lib/quotation-context"
 import { canOpenSection, getPostLoginPath } from "@/lib/user-access"
-import {
-  mobilesNeedingCallingEnrichment,
-  type JourneyCallingAction,
-} from "@/lib/full-customer-journey"
+import type { JourneyCallingAction } from "@/lib/full-customer-journey"
 import { normalizeJourneyCallingActions } from "@/lib/journey-calling-actions"
 import { readDealerCallingActions } from "@/lib/dealer-calling-action-history"
 import { isQuotationAdminAccess } from "@/lib/admin-access"
@@ -116,22 +113,6 @@ export default function CustomerJourneyPage() {
     return rows
   }, [])
 
-  const enrichPendingCallingRows = useCallback(
-    async (quotationRows: Quotation[], existing: JourneyCallingAction[]) => {
-      const missing = mobilesNeedingCallingEnrichment(quotationRows, existing, 200)
-      if (missing.length === 0) return []
-
-      const extras: JourneyCallingAction[] = []
-      for (let i = 0; i < missing.length; i += 8) {
-        const chunk = missing.slice(i, i + 8)
-        const responses = await Promise.all(chunk.map((mobile) => fetchCallingActionsForQuery(mobile)))
-        for (const list of responses) extras.push(...list)
-      }
-      return extras
-    },
-    [fetchCallingActionsForQuery],
-  )
-
   const loadJourney = useCallback(async () => {
     if (!useApi || !isAuthenticated) return
     setIsLoading(true)
@@ -140,7 +121,7 @@ export default function CustomerJourneyPage() {
 
       const [quotationsRes, actionsRes, queueRes] = await Promise.all([
         api.quotations.getAll({ limit: 500 }).catch(() => null),
-        api.dealers.callingActions.getAll({ limit: 2000, range: "all" }).catch(() => null),
+        api.dealers.callingActions.getAll({ limit: 500, range: "daily" }).catch(() => null),
         api.dealers.getCallingQueueCurrent().catch(() => null),
       ])
 
@@ -151,33 +132,23 @@ export default function CustomerJourneyPage() {
       const quotationsList = Array.isArray(quotationRows) ? quotationRows : []
       setQuotations(quotationsList)
 
-      let merged = mergeJourneyCallingActions([
+      const merged = mergeJourneyCallingActions([
         normalizeJourneyCallingActions(actionsRes),
         normalizeJourneyCallingActions(queueRes),
         localActions,
       ])
 
-      // Show the list quickly, then backfill Calling Data/Action without requiring a mobile search.
+      // Show the list from bulk calling-actions + queue. Per-mobile search is skipped
+      // because that endpoint often 400s and floods the console.
       setCallingActions(merged)
       setIsLoading(false)
-
-      const enriched = await enrichPendingCallingRows(quotationsList, merged)
-      if (enriched.length > 0) {
-        merged = mergeJourneyCallingActions([merged, enriched])
-        setCallingActions(merged)
-        // Second pass: newly matched rows may unlock nothing, but catch any still-pending after first wave.
-        const second = await enrichPendingCallingRows(quotationsList, merged)
-        if (second.length > 0) {
-          setCallingActions(mergeJourneyCallingActions([merged, second]))
-        }
-      }
     } catch (error) {
       console.error("Failed to load customer journey:", error instanceof ApiError ? error.message : error)
       setQuotations([])
       setCallingActions([])
       setIsLoading(false)
     }
-  }, [useApi, isAuthenticated, localCallingActions, enrichPendingCallingRows])
+  }, [useApi, isAuthenticated, localCallingActions])
 
   useEffect(() => {
     void loadJourney()
@@ -218,10 +189,11 @@ export default function CustomerJourneyPage() {
           quotations={quotations}
           callingActions={callingActions}
           title="Customer Journey"
-          description="Full stored journey for each customer from first call through final confirmation. Expand a row to see the timeline."
-          emptyMessage="No journey records yet. Start from Calling Data — submitted call actions and quotations will appear here."
+          description="Full stored journey for each customer from first call through final confirmation. Defaults to Today — loads 20 rows at a time; scroll for more."
+          emptyMessage="No journey records yet for this date filter. Start from Calling Data — submitted call actions and quotations will appear here."
           maxHeightClassName="max-h-[70vh]"
           isLoading={isLoading}
+          initialDateFilter="today"
           onSearchChange={handleSearchChange}
         />
       </main>

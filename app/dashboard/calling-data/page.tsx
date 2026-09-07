@@ -58,7 +58,14 @@ import {
 import { downloadPricingPdf, PRICING_PDF_SCOPE_OPTIONS, type PricingPdfScope } from "@/lib/download-dcr-pricing-pdf"
 import { PricingSheetViewDialog } from "@/components/pricing-sheet-view-dialog"
 import { usePricingTables } from "@/lib/use-pricing-tables"
-import { PhoneCall, ArrowRightCircle, Pencil, Check, X, Loader2, Download, ChevronDown, Eye } from "lucide-react"
+import { PhoneCall, ArrowRightCircle, Pencil, Check, X, Loader2, Download, ChevronDown, Eye, Sheet } from "lucide-react"
+import { Badge } from "@/components/ui/badge"
+import {
+  callingLeadToSocialDisplayRow,
+  getSocialLeadCardSurfaceClass,
+  getSocialLeadStatusDisplay,
+  isSocialMediaCallingLead,
+} from "@/lib/google-sheets-social-leads"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -88,6 +95,22 @@ type CallingLead = {
   callRemark?: string
   /** HR / calling upload batch — used with eligibleDealerIds or dealer profile batch ids for pool visibility. */
   uploadBatchId?: string
+  uploadFileName?: string
+  sourceType?: string
+  sheetSourceId?: string
+  platform?: string
+  campaignName?: string
+  adName?: string
+  /** Meta sheet `lead_status` (e.g. CREATED) — distinct from workflow `status`. */
+  sheetLeadStatus?: string
+  remarks?: string
+  remarks2?: string
+  kw?: string
+  finalDecision?: string
+  finalDecisionReason?: string
+  firstCallResponse?: string
+  secondCallResponse?: string
+  externalId?: string
   eligibleDealerIds?: string[]
 }
 
@@ -859,6 +882,40 @@ export default function CallingDataPage() {
         ).trim()
         return v || undefined
       })(),
+      uploadFileName: String(
+        source?.uploadFileName ||
+          source?.upload_file_name ||
+          source?.batchFileName ||
+          source?.batch_file_name ||
+          source?.fileName ||
+          source?.file_name ||
+          source?.upload?.fileName ||
+          source?.upload?.file_name ||
+          "",
+      ).trim() || undefined,
+      sourceType: String(source?.sourceType || source?.source_type || source?.upload?.sourceType || source?.upload?.source_type || "").trim() || undefined,
+      sheetSourceId: String(source?.sheetSourceId || source?.sheet_source_id || "").trim() || undefined,
+      platform: String(source?.platform || "").trim() || undefined,
+      campaignName: String(source?.campaignName || source?.campaign_name || "").trim() || undefined,
+      adName: String(source?.adName || source?.ad_name || "").trim() || undefined,
+      sheetLeadStatus: (() => {
+        const explicit = String(
+          source?.sheetLeadStatus || source?.sheet_lead_status || source?.metaLeadStatus || "",
+        ).trim()
+        if (explicit) return explicit
+        const platform = String(source?.platform || "").trim()
+        const leadStatusRaw = String(source?.lead_status || source?.leadStatus || "").trim()
+        if (platform && leadStatusRaw) return leadStatusRaw
+        return undefined
+      })(),
+      remarks: String(source?.remarks || "").trim() || undefined,
+      remarks2: String(source?.remarks2 || source?.remarks_2 || "").trim() || undefined,
+      kw: String(source?.kw || source?.kNumber || source?.k_number || "").trim() || undefined,
+      finalDecision: String(source?.finalDecision || source?.final_decision || "").trim() || undefined,
+      finalDecisionReason: String(source?.finalDecisionReason || source?.final_decision_reason || "").trim() || undefined,
+      firstCallResponse: String(source?.firstCallResponse || source?.first_call_response || "").trim() || undefined,
+      secondCallResponse: String(source?.secondCallResponse || source?.second_call_response || "").trim() || undefined,
+      externalId: String(source?.externalId || source?.external_id || "").trim() || undefined,
       eligibleDealerIds: (() => {
         const raw =
           source?.eligibleDealerIds ||
@@ -1980,6 +2037,23 @@ export default function CallingDataPage() {
 
   const currentLead = pinnedCurrentLead || dealerAssignedQueue[0] || null
 
+  const isSocialMediaCurrentLead = useMemo(
+    () => isSocialMediaCallingLead(currentLead),
+    [currentLead],
+  )
+
+  const socialLeadStatusDisplay = useMemo(() => {
+    if (!currentLead || !isSocialMediaCurrentLead) return null
+    return getSocialLeadStatusDisplay(callingLeadToSocialDisplayRow(currentLead))
+  }, [currentLead, isSocialMediaCurrentLead])
+
+  const socialLeadCardClass = useMemo(() => {
+    if (!socialLeadStatusDisplay) {
+      return "border-orange-200/70 bg-gradient-to-b from-white to-orange-50/30 shadow-sm"
+    }
+    return getSocialLeadCardSurfaceClass(socialLeadStatusDisplay)
+  }, [socialLeadStatusDisplay])
+
   useEffect(() => {
     if (pinnedCurrentLeadRef.current) return
     const head = dealerAssignedQueue[0]
@@ -2730,10 +2804,27 @@ export default function CallingDataPage() {
       <main className="container mx-auto px-4 py-6 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-orange-100 to-amber-100 border border-orange-200 flex items-center justify-center">
-              <PhoneCall className="w-4 h-4 text-primary" />
+            <div
+              className={`w-8 h-8 rounded-full flex items-center justify-center border ${
+                isSocialMediaCurrentLead
+                  ? "bg-gradient-to-br from-sky-100 to-indigo-100 border-sky-200"
+                  : "bg-gradient-to-br from-orange-100 to-amber-100 border-orange-200"
+              }`}
+            >
+              {isSocialMediaCurrentLead ? (
+                <Sheet className="w-4 h-4 text-sky-700" />
+              ) : (
+                <PhoneCall className="w-4 h-4 text-primary" />
+              )}
             </div>
-            <h1 className="text-xl font-semibold">Calling Data</h1>
+            <div>
+              <h1 className="text-xl font-semibold">
+                {isSocialMediaCurrentLead ? "Social Media" : "Calling Data"}
+              </h1>
+              {isSocialMediaCurrentLead ? (
+                <p className="text-xs text-muted-foreground">Meta / Google Sheet lead</p>
+              ) : null}
+            </div>
           </div>
           <CityMultiSelectFilter
             value={filterCities}
@@ -2746,11 +2837,13 @@ export default function CallingDataPage() {
           will not skip leads. The queue refreshes in the background every 5 minutes (and when you return to this tab).
         </p>
 
-        <Card>
+        <Card className={isSocialMediaCurrentLead ? "border-sky-200/60" : undefined}>
           <CardHeader className="pb-3">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 space-y-1">
-                <CardTitle className="text-base">Dealer Call Analytics</CardTitle>
+                <CardTitle className="text-base">
+                  {isSocialMediaCurrentLead ? "Social Media Call Analytics" : "Dealer Call Analytics"}
+                </CardTitle>
                 <p className="text-xs text-muted-foreground">
                   Same counts as Admin → Calling Reports for your login. Filter by daily, weekly, monthly, last month,
                   custom range, or all time.
@@ -3712,10 +3805,19 @@ export default function CallingDataPage() {
             </CardContent>
           </Card>
         ) : (
-          <Card className="border-orange-200/70 bg-gradient-to-b from-white to-orange-50/30 shadow-sm">
+          <Card className={socialLeadCardClass}>
             <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base">Current Lead</CardTitle>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <CardTitle className="text-base">
+                    {isSocialMediaCurrentLead ? "Social Media Lead" : "Current Lead"}
+                  </CardTitle>
+                  {socialLeadStatusDisplay ? (
+                    <Badge variant="outline" className={socialLeadStatusDisplay.badgeClassName}>
+                      {socialLeadStatusDisplay.label}
+                    </Badge>
+                  ) : null}
+                </div>
                 {isEditingLead ? (
                   <div className="flex items-center gap-2">
                     <Button size="sm" variant="outline" onClick={() => setIsEditingLead(false)} className="gap-1">
@@ -3752,6 +3854,28 @@ export default function CallingDataPage() {
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
+              {isSocialMediaCurrentLead ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs rounded-md border border-border/50 bg-background/60 p-3">
+                  {currentLead.platform ? (
+                    <p><span className="text-muted-foreground">Platform:</span> {currentLead.platform}</p>
+                  ) : null}
+                  {currentLead.campaignName ? (
+                    <p><span className="text-muted-foreground">Campaign:</span> {currentLead.campaignName}</p>
+                  ) : null}
+                  {currentLead.kw ? (
+                    <p><span className="text-muted-foreground">KW:</span> {currentLead.kw}</p>
+                  ) : null}
+                  {currentLead.firstCallResponse ? (
+                    <p><span className="text-muted-foreground">1st call:</span> {currentLead.firstCallResponse}</p>
+                  ) : null}
+                  {currentLead.secondCallResponse ? (
+                    <p><span className="text-muted-foreground">2nd call:</span> {currentLead.secondCallResponse}</p>
+                  ) : null}
+                  {currentLead.remarks ? (
+                    <p className="sm:col-span-2"><span className="text-muted-foreground">Remarks:</span> {currentLead.remarks}</p>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                 <div>
                   <p className="text-xs text-muted-foreground">Name</p>
@@ -3885,7 +4009,11 @@ export default function CallingDataPage() {
                 </div>
               </div>
 
-              <div className="space-y-3 pt-2 border-t border-orange-200/70">
+              <div
+                className={`space-y-3 pt-2 border-t ${
+                  isSocialMediaCurrentLead ? "border-border/60" : "border-orange-200/70"
+                }`}
+              >
                 {currentLead.status === "assigned" || currentLead.status === "queued" ? (
                   <Button
                     variant="outline"

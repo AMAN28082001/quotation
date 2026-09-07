@@ -69,6 +69,24 @@ export function readDealerCallingActions(dealerId: string): StoredDealerCallingA
   return readRaw(dealerId)
 }
 
+/** Merge per-dealer local call history (admin journey fallback when API is forbidden). */
+export function readAllDealerCallingActions(dealerIds: string[]): StoredDealerCallingAction[] {
+  const seen = new Set<string>()
+  const merged: StoredDealerCallingAction[] = []
+  for (const dealerId of dealerIds) {
+    const id = String(dealerId || "").trim()
+    if (!id) continue
+    for (const row of readDealerCallingActions(id)) {
+      const fingerprint = [row.leadId, row.actionAt || "", row.action || ""].join("|")
+      if (!fingerprint.replace(/\|/g, "").trim()) continue
+      if (seen.has(fingerprint)) continue
+      seen.add(fingerprint)
+      merged.push(row)
+    }
+  }
+  return merged
+}
+
 export function appendDealerCallingAction(
   dealerId: string,
   item: Omit<StoredDealerCallingAction, "dealerId"> & { dealerId?: string },

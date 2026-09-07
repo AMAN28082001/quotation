@@ -20,32 +20,40 @@ function pickNonEmptyString(v: unknown): string | undefined {
   return undefined
 }
 
+function addUrlFromUnknown(urls: string[], value: unknown) {
+  if (value == null) return
+  if (Array.isArray(value)) {
+    for (const item of value) addUrlFromUnknown(urls, item)
+    return
+  }
+  const normalized =
+    toPublicOpenHref(typeof value === "string" ? value : pickMediaUrlFromValue(value) || value) ||
+    (typeof value === "string" && value.trim() ? value.trim() : undefined)
+  if (normalized && !urls.includes(normalized)) urls.push(normalized)
+}
+
 function collectUrlsForInstallField(fieldKey: string, ...containers: unknown[]): string[] {
   const snake = fieldKey.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)
   const urls: string[] = []
-  const add = (s?: string) => {
-    const normalized = toPublicOpenHref(s)
-    if (normalized && !urls.includes(normalized)) urls.push(normalized)
-  }
   for (const raw of containers) {
     const o = raw as Record<string, unknown> | null | undefined
-    if (!o || typeof o !== "object") continue
-    add(pickNonEmptyString(o[`${fieldKey}PublicUrl`]))
-    add(pickNonEmptyString(o[`${fieldKey}_public_url`]))
-    add(pickNonEmptyString(o[`${snake}_public_url`]))
-    add(pickNonEmptyString(o[`${fieldKey}Url`]))
-    add(pickNonEmptyString(o[`${fieldKey}_url`]))
-    add(pickNonEmptyString(o[`${snake}_url`]))
-    const rawField = o[fieldKey]
-    if (typeof rawField === "string") add(rawField)
-    else if (rawField && typeof rawField === "object") add(pickMediaUrlFromValue(rawField))
+    if (!o || typeof o !== "object" || Array.isArray(o)) continue
+    addUrlFromUnknown(urls, o[`${fieldKey}PublicUrl`])
+    addUrlFromUnknown(urls, o[`${fieldKey}_public_url`])
+    addUrlFromUnknown(urls, o[`${snake}_public_url`])
+    addUrlFromUnknown(urls, o[`${fieldKey}Url`])
+    addUrlFromUnknown(urls, o[`${fieldKey}_url`])
+    addUrlFromUnknown(urls, o[`${snake}_url`])
+    addUrlFromUnknown(urls, o[fieldKey])
+    addUrlFromUnknown(urls, o[snake])
     const arrKeys = [`${fieldKey}s`, `${fieldKey}Urls`, `${fieldKey}_urls`, `${snake}s`, `${snake}_urls`]
-    for (const k of arrKeys) {
-      const arr = o[k]
-      if (!Array.isArray(arr)) continue
-      for (const item of arr) {
-        if (typeof item === "string") add(item)
-        else if (item && typeof item === "object") add(pickMediaUrlFromValue(item))
+    for (const k of arrKeys) addUrlFromUnknown(urls, o[k])
+    const bags = [o.installationPhotos, o.installation_photos, o.completionPhotos, o.completion_photos, o.images, o.photos]
+    for (const bag of bags) {
+      if (bag && typeof bag === "object" && !Array.isArray(bag)) {
+        const b = bag as Record<string, unknown>
+        addUrlFromUnknown(urls, b[fieldKey])
+        addUrlFromUnknown(urls, b[snake])
       }
     }
   }
@@ -111,20 +119,27 @@ export function gatherInstallationPublicImageUrls(q: Record<string, unknown>, ma
   >
   const inst = (q.installation || q.installerInstallation || q.installationCompletion || {}) as Record<string, unknown>
 
+  const nested = [
+    q,
+    !Array.isArray(doc) ? doc : undefined,
+    !Array.isArray(inst) ? inst : undefined,
+    (q.installation || q.installerInstallation) as Record<string, unknown> | undefined,
+    q.installerCompletion as Record<string, unknown> | undefined,
+    q.installationCompletion as Record<string, unknown> | undefined,
+    (doc as Record<string, unknown>).installation as Record<string, unknown> | undefined,
+    (doc as Record<string, unknown>).installerCompletion as Record<string, unknown> | undefined,
+    (doc as Record<string, unknown>).installationCompletion as Record<string, unknown> | undefined,
+    (inst as Record<string, unknown>).documents as Record<string, unknown> | undefined,
+    (inst as Record<string, unknown>).images as Record<string, unknown> | undefined,
+    (inst as Record<string, unknown>).photos as Record<string, unknown> | undefined,
+  ].filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object" && !Array.isArray(x))
+
   for (const fieldKey of OPERATIONAL_INSTALLATION_IMAGE_FIELD_KEYS) {
-    for (const url of collectUrlsForInstallField(fieldKey, doc, q, inst)) {
+    for (const url of collectUrlsForInstallField(fieldKey, ...nested)) {
       addDedupedUrl(out, max, url)
     }
   }
   for (const url of extractPiMediaUrls(q)) addDedupedUrl(out, max, url)
-
-  const nested = [
-    q,
-    doc,
-    (q.installation || q.installerInstallation) as Record<string, unknown> | undefined,
-    q.installerCompletion as Record<string, unknown> | undefined,
-    q.installationCompletion as Record<string, unknown> | undefined,
-  ].filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object")
 
   const arrayKeys = [
     "siteCompletionImages",
@@ -141,6 +156,34 @@ export function gatherInstallationPublicImageUrls(q: Record<string, unknown>, ma
   for (const src of nested) {
     for (const k of arrayKeys) {
       collectUrlsFromArrayLike(src[k], out, max)
+    }
+  }
+
+  const documentList = Array.isArray(q.documents)
+    ? q.documents
+    : Array.isArray(q.installationDocuments)
+      ? q.installationDocuments
+      : null
+  if (documentList) {
+    const qid = String(q.id || "").trim().toLowerCase()
+    for (const item of documentList) {
+      if (out.length >= max) break
+      if (item && typeof item === "object") {
+        const rec = item as Record<string, unknown>
+        const owner = String(rec.quotationId || rec.quotation_id || rec.quotationID || "").trim().toLowerCase()
+        if (owner && qid && owner !== qid) continue
+        const fieldHint = String(rec.field || rec.fieldKey || rec.field_key || rec.type || rec.documentType || "").trim()
+        if (fieldHint) {
+          for (const fieldKey of OPERATIONAL_INSTALLATION_IMAGE_FIELD_KEYS) {
+            if (fieldHint === fieldKey || fieldHint.replace(/-/g, "").toLowerCase() === fieldKey.toLowerCase()) {
+              for (const url of collectUrlsForInstallField(fieldKey, rec)) addDedupedUrl(out, max, url)
+            }
+          }
+        }
+        addDedupedUrl(out, max, pickMediaUrlFromValue(item))
+      } else {
+        addDedupedUrl(out, max, pickMediaUrlFromValue(item))
+      }
     }
   }
 
@@ -168,6 +211,67 @@ export function gatherInstallationPublicImageUrls(q: Record<string, unknown>, ma
     }
   }
 
+  return out
+}
+
+function last10Digits(value: unknown): string {
+  const digits = String(value || "").replace(/\D/g, "")
+  if (digits.length >= 10) return digits.slice(-10)
+  return digits
+}
+
+function quotationIdentityTokens(q: Record<string, unknown>): string[] {
+  const customer = q.customer as Record<string, unknown> | undefined
+  const tokens = [
+    q.id,
+    q.quotationId,
+    q.quotation_id,
+    q.quotationNumber,
+    q.quotation_number,
+    q.quotationNo,
+    customer?.id,
+    last10Digits(customer?.mobile || customer?.phone || q.customerMobile || q.mobile),
+  ]
+    .map((v) => String(v || "").trim().toLowerCase())
+    .filter((v) => v.length >= 4)
+  return [...new Set(tokens)]
+}
+
+export function installationUrlBelongsToQuotation(url: string, q: Record<string, unknown>): boolean {
+  let hay = url.toLowerCase()
+  try {
+    hay = decodeURIComponent(url).toLowerCase()
+  } catch {
+    // keep raw
+  }
+  return quotationIdentityTokens(q).some((token) => hay.includes(token))
+}
+
+/** Photos for this customer only — list APIs sometimes attach every URL to the first row. */
+export function resolveInstallationPhotoUrlsForQuotation(
+  q: Record<string, unknown>,
+  pool: Array<Record<string, unknown>>,
+  max = 24,
+): string[] {
+  const out: string[] = []
+  const qid = String(q.id || "").trim()
+  const rows = pool.length > 0 ? pool : [q]
+
+  for (const row of rows) {
+    for (const url of gatherInstallationPublicImageUrls(row, 48)) {
+      if (installationUrlBelongsToQuotation(url, q)) addDedupedUrl(out, max, url)
+    }
+  }
+
+  if (out.length > 0) return out
+
+  for (const url of gatherInstallationPublicImageUrls(q, max)) {
+    const belongsToSomeoneElse = rows.some((row) => {
+      const oid = String(row.id || "").trim()
+      return oid && oid !== qid && installationUrlBelongsToQuotation(url, row)
+    })
+    if (!belongsToSomeoneElse) addDedupedUrl(out, max, url)
+  }
   return out
 }
 

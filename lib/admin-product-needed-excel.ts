@@ -67,23 +67,63 @@ const CUSTOMER_HEADERS = [
   "Released To Installation",
 ]
 
+/** Columns offered in the Excel column picker for Product Needed downloads. */
+export const PRODUCT_NEEDED_EXCEL_COLUMN_OPTIONS = [
+  ...CUSTOMER_HEADERS,
+  "Panel Brand",
+  "Panel Size",
+  "Quantity",
+  "Unit",
+  "Inverter Brand",
+  "Inverter Rating",
+  "Released",
+  "Category",
+  "Brand",
+  "Size / Rating",
+  "Jobs",
+].map((label) => ({ id: label, label }))
+
 /**
  * One workbook for the currently visible, login-scoped Product Needed rows:
  * summary, one sheet per panel/inverter brand, and customer sheets by system type.
+ * When `selectedColumnIds` is set, each sheet keeps only matching header labels
+ * (summary sheet always keeps its own headers unless you also select those labels).
  */
 export async function downloadProductNeededExcel(
   dashboard: ProductNeededDashboard,
+  options?: { selectedColumnIds?: string[] },
 ): Promise<void> {
   const XLSX = await import("xlsx")
   const workbook = XLSX.utils.book_new()
   const usedNames = new Set<string>()
+  const selectedSet =
+    options?.selectedColumnIds && options.selectedColumnIds.length > 0
+      ? new Set(options.selectedColumnIds)
+      : null
+
+  const filterSheet = (headers: string[], rows: CellValue[][]) => {
+    if (!selectedSet) return { headers, rows }
+    const indices = headers
+      .map((header, index) => ({ header, index }))
+      .filter(({ header }) => selectedSet.has(header))
+    // If no overlap (e.g. Summary sheet vs customer columns), keep full sheet.
+    if (indices.length === 0) return { headers, rows }
+    return {
+      headers: indices.map((item) => item.header),
+      rows: rows.map((row) => indices.map(({ index }) => row[index] ?? "")),
+    }
+  }
 
   const appendSheet = (name: string, headers: string[], rows: CellValue[][]) => {
-    const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows])
-    sheet["!autofilter"] = { ref: `A1:${XLSX.utils.encode_col(headers.length - 1)}1` }
+    const filtered = filterSheet(headers, rows)
+    if (!filtered.headers.length) return
+    const sheet = XLSX.utils.aoa_to_sheet([filtered.headers, ...filtered.rows])
+    sheet["!autofilter"] = {
+      ref: `A1:${XLSX.utils.encode_col(filtered.headers.length - 1)}1`,
+    }
     sheet["!freeze"] = { xSplit: 0, ySplit: 1 }
-    sheet["!cols"] = headers.map((header, index) => {
-      const maxContent = rows.reduce(
+    sheet["!cols"] = filtered.headers.map((header, index) => {
+      const maxContent = filtered.rows.reduce(
         (max, row) => Math.max(max, String(row[index] ?? "").length),
         header.length,
       )
